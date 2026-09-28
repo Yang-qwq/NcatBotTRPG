@@ -1,0 +1,9 @@
+name = "NcatBotTRPG"
+version = "0.1.0"
+main = "main.py"
+entry_class = "NcatBotTRPGPlugin"
+author = "Yang-qwq"
+description = "TRPG 跑团插件：通用掷骰 + 极简 AI 主持 + 三层 RBAC 权限"
+
+[pip_dependencies]
+openai = ">=1.95.1"
