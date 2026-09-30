@@ -16,6 +16,7 @@ from ncatbot.utils import get_config_manager
 from ncatbot.utils.logger import get_log
 
 from . import dice
+from .session import ROOM_STATUS_TEXT
 
 _log = get_log('ncatbot_trpg')
 
@@ -39,23 +40,44 @@ ROLL_HELP_TEXT = '''掷骰用法：
 
 USER_HELP_TEXT = '''NcatBotTRPG 用户命令帮助：
 
-/trpg roll <骰式> [判定] - 公开掷骰/检定
-/trpg rh <骰式> [判定] - 暗骰（结果私聊发送）
-/trpg start [设定] - 开启本会话的 AI 跑团（群内需管理员）
+# 🏠 房间管理（群聊专用，每群默认有一个房间，无需创建）
+/trpg room join [密码] - 加入当前群房间
+/trpg room leave - 离开当前群房间  
+/trpg room status - 查看当前群房间状态
+/trpg room participants - 查看房间参与者列表
+
+# 🎭 玩家状态管理（群聊专用）
+/trpg away [原因] - 暂时离开游戏
+/trpg offline [原因] - 长时间离线
+/trpg back - 重新加入游戏
+/trpg ai-control [原因] - 请求AI托管角色
+/trpg status - 查看当前团状态和玩家状态
+
+# 🎭 跑团控制
+/trpg start [设定] - 开启本会话的 AI 跑团（群内需管理员；创建房间可管理参与者）
 /trpg act <行动> - 向 AI 主持提交一次行动
-/trpg status - 查看当前团状态
 /trpg prompt [set <设定>|show|reset] - 查看/设置本团专属设定（群内需管理员）
+/trpg prompt list - 查看可用的提示词模板
+/trpg prompt switch <提示词名> - 切换当前使用的提示词
+/trpg prompt show [提示词名] - 显示提示词内容
 /trpg reset - 清空剧情历史，保留设定（群内需管理员）
 /trpg stop - 结束本会话的团（群内需管理员）
 /trpg help - 显示此帮助
 
-局内关键词：团激活后可用 .r / .rh 快速掷骰/暗骰'''
+# 🎲 掷骰系统
+/trpg roll <骰式> [判定] - 公开掷骰/检定
+/trpg rh <骰式> [判定] - 暗骰（结果私聊发送）
+
+局内关键词：团激活后可用 .r / .rh 快速掷骰/暗骰
+
+💡 提示：使用房间系统可以让主持人知道所有参与者，提供更好的游戏体验！'''
 
 ADMIN_HELP_TEXT = '''NcatBotTRPG 管理员命令帮助：
 
 /trpg-admin stop [group:<id>|user:<id>] - 结束指定会话的团
 /trpg-admin reset [group:<id>|user:<id>] - 清空指定会话的剧情历史
 /trpg-admin prompt <set <设定>|show|reset> [group:<id>|user:<id>] - 管理专属设定
+/trpg-admin room-admin <set-description|set-password|set-max|delete> [参数] - 房间管理
 /trpg-admin help - 显示此帮助
 
 不指定目标时作用于当前会话；仅全局管理员或本群群主/群管理可用。'''
@@ -207,7 +229,7 @@ class NcatBotTRPGCommandMixin:
         target = None
         rest = []
         for item in args:
-            if target is None and (item.startswith('group:') or item.startswith('user:')):
+            if target is None and item.startswith(('group:', 'user:')):
                 target = item
             else:
                 rest.append(item)
@@ -293,6 +315,16 @@ class NcatBotTRPGCommandMixin:
             await self._cmd_reset(event)
         elif sub == 'stop':
             await self._cmd_stop(event)
+        elif sub == 'room':
+            await self._cmd_room(event, args)
+        elif sub == 'away':
+            await self._cmd_away(event, args)
+        elif sub == 'offline':
+            await self._cmd_offline(event, args)
+        elif sub == 'back':
+            await self._cmd_back(event)
+        elif sub == 'ai-control':
+            await self._cmd_ai_control(event, args)
         elif sub == 'help':
             await event.reply(text=USER_HELP_TEXT, at_sender=False)
         else:
@@ -380,6 +412,29 @@ class NcatBotTRPGCommandMixin:
         scope, sid = self._scope_sid(event)
         if scope == 'group' and not await self._check_admin(event):
             return
+            
+        # 群聊：房间与会话绑定，每群默认有一个房间（无需创建、0 人起步）
+        room = self.session_store.get_or_create_room(sid) if scope == 'group' else None
+        if room is not None:
+            if room['status'] not in ('preparing', 'finished'):
+                await event.reply(
+                    text='❌ 房间不是准备状态，无法开始跑团',
+                    at_sender=False,
+                )
+                return
+
+            # 发起人自动加入房间（无密码房间；有密码需玩家自行 /trpg room join）
+            if not room['password']:
+                self.session_store.join_room(sid, str(event.user_id))
+
+            # 开始房间
+            if not self.session_store.start_room(sid):
+                await event.reply(
+                    text='❌ 开始房间失败',
+                    at_sender=False,
+                )
+                return
+                
         if not self.get_config('IsConfigured'):
             _log.warning(f'[{scope} {sid}] 开团被拒：插件未配置')
             await event.reply(
@@ -398,14 +453,27 @@ class NcatBotTRPGCommandMixin:
             return
 
         prompt = ' '.join(args).strip()
+
         self.session_store.create(scope, sid, prompt=prompt)
         self._save_data()
         _log.info(f'[{scope} {sid}] 已开启跑团')
-        await event.reply(
-            text=f'✅ 已开启跑团。用 @我 或 /trpg act <行动> 开始行动；'
-                 f'掷骰用 /trpg roll 或 {self._dice_keyword_tip()}',
-            at_sender=False,
-        )
+        
+        # 群聊中若存在房间则显示参与者信息
+        if room is not None:
+            participant_names = self.session_store.participant_names(sid)
+            await event.reply(
+                text=f'✅ 已开启跑团！\n'
+                     f'👥 参与者：{", ".join(participant_names)}\n'
+                     f'用 @我 或 /trpg act <行动> 开始行动；'
+                     f'掷骰用 /trpg roll 或 {self._dice_keyword_tip()}',
+                at_sender=False,
+            )
+        else:
+            await event.reply(
+                text=f'✅ 已开启跑团。用 @我 或 /trpg act <行动> 开始行动；'
+                     f'掷骰用 /trpg roll 或 {self._dice_keyword_tip()}',
+                at_sender=False,
+            )
 
     async def _cmd_act(self, event: MessageEvent, args: list[str]):
         """向 AI 主持提交一次行动。"""
@@ -422,37 +490,43 @@ class NcatBotTRPGCommandMixin:
         await self._handle_action(event, text, scope, sid)
 
     async def _cmd_status(self, event: MessageEvent):
-        """查看当前团状态。"""
+        """查看当前团状态（群聊同时展示房间与玩家状态）。"""
         scope, sid = self._scope_sid(event)
+        lines: list[str] = []
+
+        # 群聊：房间信息与玩家状态
+        if scope == 'group':
+            room = self.session_store.room_view(sid)
+            lines.append(f'🏠 房间信息：{room["name"]}')
+            lines.append(f'📊 状态：{ROOM_STATUS_TEXT.get(room["status"], "未知")}')
+            lines.append(f'👥 总参与者：{len(room["participants"])}人')
+
+            if room['status'] == 'running':
+                active_players = self.session_store.get_active_players(sid)
+                lines.append(f'🎮 活跃玩家：{len(active_players)}人')
+                player_status_info = self.session_store.build_player_status_info(sid)
+                if player_status_info:
+                    lines.append(player_status_info)
+                requesting_players = self.session_store.has_requests_for_ai_control(sid)
+                if requesting_players:
+                    lines.append(f'⚠️ AI托管请求：{len(requesting_players)}人')
+
+        # 团会话状态
         session = self.session_store.get(scope, sid)
         if session is None:
             _log.debug(f'[{scope} {sid}] /trpg status：无跑团记录')
-            await event.reply(text='本会话暂无跑团记录，使用 /trpg start 开启', at_sender=False)
-            return
-        _log.debug(f'[{scope} {sid}] /trpg status：active={session.get("active")}')
-        state = '进行中' if session.get('active') else '已结束'
-        prompt = (session.get('prompt') or '').strip()
-        if len(prompt) > 30:
-            prompt_desc = prompt[:30] + '…'
+            lines.append('📖 本会话暂无跑团记录，使用 /trpg start 开启')
         else:
-            prompt_desc = prompt or '（默认主持人设定）'
-        lines = [
-            f'📖 本会话跑团状态：{state}',
-            f'开始时间：{session.get("started_at", "未知")}',
-            f'专属设定：{prompt_desc}',
-            f'已记录剧情消息：{len(session.get("history", []))} 条',
-        ]
-        await event.reply(text='\n'.join(lines), at_sender=False)
+            _log.debug(f'[{scope} {sid}] /trpg status：active={session.get("active")}')
+            state = '进行中' if session.get('active') else '已结束'
+            prompt = (session.get('prompt') or '').strip()
+            prompt_desc = (prompt[:30] + '…') if len(prompt) > 30 else (prompt or '（默认主持人设定）')
+            lines.append(f'📖 本会话跑团状态：{state}')
+            lines.append(f'开始时间：{session.get("started_at", "未知")}')
+            lines.append(f'专属设定：{prompt_desc}')
+            lines.append(f'已记录剧情消息：{len(session.get("history", []))} 条')
 
-    async def _cmd_prompt(self, event: MessageEvent, args: list[str]):
-        """查看/设置本团专属主持人设定。"""
-        scope, sid = self._scope_sid(event)
-        if scope == 'group' and not await self._check_admin(event):
-            return
-        reply_text = self._apply_prompt(scope, sid, args)
-        self._save_data()
-        _log.info(f'[{scope} {sid}] /trpg prompt -> {reply_text}')
-        await event.reply(text=reply_text, at_sender=False)
+        await event.reply(text='\n'.join(lines), at_sender=False)
 
     async def _cmd_reset(self, event: MessageEvent):
         """清空当前会话的剧情历史（保留设定）。"""
@@ -514,6 +588,8 @@ class NcatBotTRPGCommandMixin:
         if session is None or not session.get('active'):
             return '当前没有进行中的团'
         self.session_store.update(scope, sid, active=False)
+        if scope == 'group':
+            self.session_store.finish_room(sid)
         _log.info(f'[{scope} {sid}] 已结束团会话')
         return '🛑 已结束本会话的团（剧情记录保留，可用 /trpg reset 后重新 start）'
 
@@ -548,6 +624,15 @@ class NcatBotTRPGCommandMixin:
             reply_text = self._apply_reset(scope, sid)
         elif sub == 'prompt':
             reply_text = self._apply_prompt(scope, sid, rest)
+        elif sub == 'room-admin':
+            if scope != 'group':
+                await event.reply(
+                    text='房间管理需在群内或使用 group:<id> 指定目标',
+                    at_sender=False,
+                )
+                return
+            await self._cmd_room_admin(event, sid, rest)
+            return
         else:
             _log.warning(f'[{event.user_id}] 未知 /trpg-admin 子命令: {sub!r}')
             await event.reply(text='未知管理员命令，请使用 /trpg-admin help 查看帮助', at_sender=False)

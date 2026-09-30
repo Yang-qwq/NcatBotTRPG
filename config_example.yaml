@@ -1,0 +1,40 @@
+# NcatBotTRPG 插件配置示例
+# 
+# 使用方法：
+# 1. 复制此配置到工作区根目录的 config.yaml 文件中
+# 2. 在 plugin_configs.NcatBotTRPG 部分添加以下配置
+# 3. 确保 prompts.yaml 文件位于插件工作区 (data/NcatBotTRPG/prompts.yaml)
+
+# 插件配置示例（应放在 config.yaml 的 plugin_configs.NcatBotTRPG 下）：
+# 
+# plugin:
+#   plugin_configs:
+#     NcatBotTRPG:
+#       # === 基础配置 ===
+#       ApiKey: "sk-your-openai-api-key-here"        # OpenAI API 密钥（使用 AI 功能时必需）
+#       Model: "openai/gpt-4o-mini"                  # 使用的模型
+#       BaseUrl: "https://api.openai.com/v1"          # API 基础 URL
+#       IsConfigured: true                           # 必须设置为 true 才能使用 AI 功能
+#       
+#       # === 行为配置 ===
+#       MustAtBot: true                              # 群聊中是否必须 @机器人 才触发 AI 主持
+#       InsertUserdataAsPrefix: true                  # 群聊行动是否附带 昵称(QQ) 前缀
+#       MaxHistoryMessages: 30                        # 每团保留的历史消息数
+#       EnableCriticalDice: true                     # 是否启用大成功/大失败判定
+#       EnableGroupOwnerAutoAuth: true                # 是否启用群主/群管理自动授权
+#       EnableInGameDiceKeyword: true                 # 是否启用局内掷骰关键词
+#       InGameDiceKeyword: ".r"                      # 局内掷骰关键词（h 后缀为暗骰）
+#       MaxDiceCount: 100                            # 单次最大骰子数量（防刷）
+#       MaxDiceSides: 10000                          # 骰子最大面数（防刷）
+#       StripReasoning: true                         # 是否剥离 AI 思维链（防止暴露）
+#       
+#       # === 提示词配置 ===
+#       PromptConfigFile: "prompts.yaml"             # 提示词配置文件路径（相对于插件工作区）
+#       ActivePrompt: "default"                       # 当前激活的提示词名称
+
+# 注意事项：
+# 1. 提示词配置文件 (prompts.yaml) 应放在插件工作区：data/NcatBotTRPG/prompts.yaml
+# 2. 如果 prompts.yaml 不存在，插件会使用内置的默认提示词
+# 3. AvailablePrompts 列表由插件自动加载，无需手动配置
+# 4. 只使用掷骰功能时，可以不配置 ApiKey/Model/BaseUrl，但 IsConfigured 必须为 true
+# 5. 插件默认值：IsConfigured 为 false，需要用户手动设置为 true

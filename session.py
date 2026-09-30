@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-"""团会话状态存取（自研）
+"""团会话状态存取
 
-每个会话（群聊按 group_id、私聊按 user_id）对应一个“团”，保存激活状态、
+每个会话（群聊按 group_id、私聊按 user_id）对应一个"团"，保存激活状态、
 专属主持人设定与剧情历史。存储直接引用 ``DataMixin`` 的 ``plugin.data['sessions']``，
 由插件在变更后调用 ``_save_data()`` 持久化。
+
+房间系统：房间与群会话绑定，每群默认有且只有一个房间（惰性创建、默认 0 人），
+/trpg start 后向 LLM 传递参与人员信息。
 """
 from __future__ import annotations
 
@@ -17,6 +20,18 @@ _log = get_log('ncatbot_trpg')
 # 会话作用域：group（群聊） / user（私聊）
 SCOPES = ('group', 'user')
 
+# 房间状态到中文展示
+ROOM_STATUS_TEXT = {'preparing': '准备中', 'running': '进行中', 'finished': '已结束'}
+
+
+def player_label(user_id: str) -> str:
+    """参与者在回复中的展示名（暂用 QQ 号，后续可换昵称）。
+
+    :param user_id: 用户 QQ
+    :return: 展示名
+    """
+    return f'玩家{user_id}'
+
 
 class SessionStore:
     """团会话状态管理器。"""
@@ -29,6 +44,430 @@ class SessionStore:
         self._sessions = sessions
         for scope in SCOPES:
             self._sessions.setdefault(scope, {})
+        
+        # 房间系统数据结构：group_id -> room_info
+        self._rooms = sessions.setdefault('rooms', {})
+
+    # ------------------------------------------------------------------
+    # 房间系统：群与房间绑定，每群有且只有一个房间（惰性默认 0 人）
+    # ------------------------------------------------------------------
+
+    def _default_room(self, group_id: str) -> dict:
+        """构造默认房间（不落库）：0 人、准备中。"""
+        return {
+            'name': f'群 {group_id} 的房间',
+            'created_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'participants': [],  # 默认 0 人，玩家 /trpg room join 后加入
+            'status': 'preparing',  # preparing, running, finished
+            'max_participants': 0,  # 0 表示无限制
+            'password': '',  # 房间密码（可选）
+            'description': '',  # 房间描述
+        }
+
+    def get_or_create_room(self, group_id: str) -> dict:
+        """获取群房间；不存在时惰性创建并持久化默认房间（0 人）。
+
+        每个群默认有且只有一个房间，与群会话（group_id）绑定，无需手动创建。
+
+        :param group_id: 群号
+        :return: 房间信息
+        """
+        room = self._rooms.get(str(group_id))
+        if room is None:
+            room = self._default_room(group_id)
+            self._rooms[str(group_id)] = room
+            _log.info(f'惰性创建默认房间：群({group_id})')
+        return room
+
+    def room_view(self, group_id: str) -> dict:
+        """只读获取房间视图：不存在时返回临时默认房间，不写库。
+
+        :param group_id: 群号
+        :return: 房间信息（可能是未持久化的默认房间）
+        """
+        return self._rooms.get(str(group_id)) or self._default_room(group_id)
+
+    def get_room(self, group_id: str) -> Optional[dict]:
+        """获取已持久化的房间信息；不存在返回 None。
+
+        :param group_id: 群号
+        :return: 房间信息或 None
+        """
+        return self._rooms.get(str(group_id))
+
+    def join_room(self, group_id: str, user_id: str, password: str = '') -> bool:
+        """加入房间。
+
+        :param group_id: 群号
+        :param user_id: 用户QQ
+        :param password: 房间密码（如果需要）
+        :return: 是否成功加入
+        """
+        room = self.get_or_create_room(group_id)
+
+        # 检查房间状态
+        if room['status'] not in ('preparing', 'finished'):
+            _log.warning(f'房间({group_id})状态不是准备中，无法加入')
+            return False
+            
+        # 检查密码
+        if room['password'] and room['password'] != password:
+            _log.warning(f'房间({group_id})密码错误')
+            return False
+            
+        # 检查人数限制
+        if room['max_participants'] > 0 and len(room['participants']) >= room['max_participants']:
+            _log.warning(f'房间({group_id})已满')
+            return False
+            
+        # 检查是否已在房间中
+        if str(user_id) in room['participants']:
+            _log.info(f'用户({user_id})已在房间({group_id})中')
+            return True
+            
+        # 加入房间
+        room['participants'].append(str(user_id))
+        _log.info(f'用户({user_id})加入房间({group_id})')
+        return True
+
+    def leave_room(self, group_id: str, user_id: str) -> bool:
+        """离开房间。
+
+        :param group_id: 群号
+        :param user_id: 用户QQ
+        :return: 是否成功离开
+        """
+        room = self.get_room(group_id)
+        if room is None:
+            _log.warning(f'房间不存在：群({group_id})')
+            return False
+            
+        if str(user_id) not in room['participants']:
+            _log.info(f'用户({user_id})不在房间({group_id})中')
+            return False
+            
+        # 离开房间：清除玩家状态，房间保留（清空后仍为默认 0 人房间）
+        room['participants'].remove(str(user_id))
+        room.get('player_statuses', {}).pop(str(user_id), None)
+        _log.info(f'用户({user_id})离开房间({group_id})，剩余 {len(room["participants"])} 人')
+
+        return True
+
+    def start_room(self, group_id: str) -> bool:
+        """开始房间（进入跑团状态）。
+
+        :param group_id: 群号
+        :return: 是否成功开始
+        """
+        room = self.get_or_create_room(group_id)
+
+        if room['status'] not in ('preparing', 'finished'):
+            _log.warning(f'房间({group_id})状态不是准备中，无法开始')
+            return False
+            
+        if len(room['participants']) < 1:
+            _log.warning(f'房间({group_id})没有参与者，无法开始')
+            return False
+            
+        # 更新房间状态
+        room['status'] = 'running'
+        room['started_at'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        _log.info(f'房间({group_id})开始跑团，参与者：{len(room["participants"])}人')
+        return True
+
+    def finish_room(self, group_id: str) -> bool:
+        """结束房间（跑团结束）。
+
+        :param group_id: 群号
+        :return: 是否成功结束
+        """
+        room = self.get_room(group_id)
+        if room is None:
+            return False
+
+        room['status'] = 'finished'
+        room['finished_at'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        _log.info(f'房间({group_id})结束跑团')
+        return True
+
+    def delete_room(self, group_id: str) -> bool:
+        """删除房间（下次访问会重新惰性创建默认房间）。
+
+        :param group_id: 群号
+        :return: 是否成功删除
+        """
+        if self._rooms.pop(str(group_id), None) is None:
+            return False
+        _log.info(f'房间({group_id})已删除')
+        return True
+
+    def update_room(self, group_id: str, **fields) -> bool:
+        """更新房间信息。
+
+        :param group_id: 群号
+        :param fields: 要更新的字段
+        :return: 是否成功更新
+        """
+        room = self.get_or_create_room(group_id)
+
+        room.update(fields)
+        _log.info(f'房间({group_id})更新字段: {list(fields)}')
+        return True
+
+    def get_participants(self, group_id: str) -> List[str]:
+        """获取房间参与者列表。
+
+        :param group_id: 群号
+        :return: 参与者QQ列表
+        """
+        room = self.get_room(group_id)
+        if room is None:
+            return []
+        return room['participants']
+
+    def is_participant(self, group_id: str, user_id: str) -> bool:
+        """检查用户是否是房间参与者。
+
+        :param group_id: 群号
+        :param user_id: 用户QQ
+        :return: 是否是参与者
+        """
+        room = self.get_room(group_id)
+        if room is None:
+            return False
+        return str(user_id) in room['participants']
+
+    def get_participant_count(self, group_id: str) -> int:
+        """获取房间参与者数量。
+
+        :param group_id: 群号
+        :return: 参与者数量
+        """
+        room = self.get_room(group_id)
+        if room is None:
+            return 0
+        return len(room['participants'])
+
+    def build_participants_info(self, group_id: str) -> str:
+        """构建参与者信息，用于传递给LLM。
+
+        :param group_id: 群号
+        :return: 参与者信息文本
+        """
+        participants = self.get_participants(group_id)
+        if not participants:
+            return ''
+            
+        participant_info = []
+        for i, user_id in enumerate(participants, 1):
+            participant_info.append(f'{i}. {player_label(user_id)}')
+            
+        return '\n'.join(participant_info)
+
+    def participant_names(self, group_id: str) -> List[str]:
+        """获取参与者展示名列表（暂用 QQ 号）。
+
+        :param group_id: 群号
+        :return: 展示名列表
+        """
+        return [player_label(uid) for uid in self.get_participants(group_id)]
+
+    def set_room_description(self, group_id: str, description: str) -> bool:
+        """设置房间描述。
+
+        :param group_id: 群号
+        :param description: 描述文本
+        :return: 是否成功设置
+        """
+        return self.update_room(group_id, description=description)
+
+    def set_room_password(self, group_id: str, password: str) -> bool:
+        """设置房间密码。
+
+        :param group_id: 群号
+        :param password: 密码文本
+        :return: 是否成功设置
+        """
+        return self.update_room(group_id, password=password)
+
+    def set_room_max_participants(self, group_id: str, max_participants: int) -> bool:
+        """设置房间最大参与者数量。
+
+        :param group_id: 群号
+        :param max_participants: 最大数量
+        :return: 是否成功设置
+        """
+        return self.update_room(group_id, max_participants=max_participants)
+
+    # ------------------------------------------------------------------
+    # 玩家状态管理：中途退出/请求托管/重新加入
+    # ------------------------------------------------------------------
+
+    def set_player_status(self, group_id: str, user_id: str, status: str, reason: str = '') -> bool:
+        """设置玩家状态。
+
+        :param group_id: 群号
+        :param user_id: 用户QQ
+        :param status: 玩家状态（active, away, offline, requested_ai_control）
+        :param reason: 状态原因
+        :return: 是否成功设置
+        """
+        room = self.get_room(group_id)
+        if not room:
+            return False
+            
+        if str(user_id) not in room['participants']:
+            return False
+            
+        # 初始化玩家状态字典（如果不存在）
+        if 'player_statuses' not in room:
+            room['player_statuses'] = {}
+            
+        # 更新玩家状态
+        room['player_statuses'][str(user_id)] = {
+            'status': status,
+            'reason': reason,
+            'updated_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        _log.info(f'玩家({user_id})状态更新为{status}，原因：{reason}')
+        return True
+
+    def get_player_status(self, group_id: str, user_id: str) -> Optional[dict]:
+        """获取玩家状态。
+
+        :param group_id: 群号
+        :param user_id: 用户QQ
+        :return: 玩家状态信息，不存在返回None
+        """
+        room = self.get_room(group_id)
+        if not room:
+            return None
+            
+        if 'player_statuses' not in room:
+            return None
+            
+        return room['player_statuses'].get(str(user_id))
+
+    def get_all_player_statuses(self, group_id: str) -> dict:
+        """获取所有玩家状态。
+
+        :param group_id: 群号
+        :return: 所有玩家状态信息
+        """
+        room = self.get_room(group_id)
+        if not room:
+            return {}
+            
+        return room.get('player_statuses', {})
+
+    def get_active_players(self, group_id: str) -> List[str]:
+        """获取活跃玩家列表。
+
+        :param group_id: 群号
+        :return: 活跃玩家QQ列表
+        """
+        room = self.get_room(group_id)
+        if not room:
+            return []
+            
+        active_players = []
+        statuses = self.get_all_player_statuses(group_id)
+        
+        for user_id in room['participants']:
+            status_info = statuses.get(str(user_id))
+            if not status_info or status_info['status'] == 'active':
+                active_players.append(user_id)
+                
+        return active_players
+
+    def request_ai_control(self, group_id: str, user_id: str, reason: str = '') -> bool:
+        """请求AI托管。
+
+        :param group_id: 群号
+        :param user_id: 用户QQ
+        :param reason: 请求原因
+        :return: 是否成功请求
+        """
+        return self.set_player_status(group_id, user_id, 'requested_ai_control', reason)
+
+    def set_player_away(self, group_id: str, user_id: str, reason: str = '') -> bool:
+        """设置玩家离开。
+
+        :param group_id: 群号
+        :param user_id: 用户QQ
+        :param reason: 离开原因
+        :return: 是否成功设置
+        """
+        return self.set_player_status(group_id, user_id, 'away', reason)
+
+    def set_player_offline(self, group_id: str, user_id: str, reason: str = '') -> bool:
+        """设置玩家离线。
+
+        :param group_id: 群号
+        :param user_id: 用户QQ
+        :param reason: 离线原因
+        :return: 是否成功设置
+        """
+        return self.set_player_status(group_id, user_id, 'offline', reason)
+
+    def reactivate_player(self, group_id: str, user_id: str) -> bool:
+        """重新激活玩家。
+
+        :param group_id: 群号
+        :param user_id: 用户QQ
+        :return: 是否成功激活
+        """
+        return self.set_player_status(group_id, user_id, 'active', '重新加入游戏')
+
+    def build_player_status_info(self, group_id: str) -> str:
+        """构建玩家状态信息，用于传递给LLM。
+
+        :param group_id: 群号
+        :return: 玩家状态信息文本
+        """
+        room = self.get_room(group_id)
+        if not room:
+            return ''
+            
+        participants = room['participants']
+        statuses = self.get_all_player_statuses(group_id)
+        
+        if not participants:
+            return ''
+            
+        status_lines = ['【玩家状态】']
+        
+        for i, user_id in enumerate(participants, 1):
+            status_info = statuses.get(str(user_id))
+            if status_info:
+                status_text = status_info['status']
+                reason_text = f' ({status_info["reason"]})' if status_info['reason'] else ''
+                updated_at = f' @ {status_info["updated_at"]}' if status_info.get('updated_at') else ''
+                status_lines.append(f'{i}. {player_label(user_id)}: {status_text}{reason_text}{updated_at}')
+            else:
+                status_lines.append(f'{i}. {player_label(user_id)}: 活跃')
+                
+        return '\n'.join(status_lines)
+
+    def has_requests_for_ai_control(self, group_id: str) -> List[str]:
+        """检查是否有玩家请求AI托管。
+
+        :param group_id: 群号
+        :return: 请求AI托管的玩家列表
+        """
+        room = self.get_room(group_id)
+        if not room:
+            return []
+            
+        requesting_players = []
+        statuses = self.get_all_player_statuses(group_id)
+        
+        for user_id, status_info in statuses.items():
+            if status_info['status'] == 'requested_ai_control':
+                requesting_players.append(user_id)
+                
+        return requesting_players
 
     def get(self, scope: str, session_id) -> Optional[dict]:
         """获取会话；不存在返回 None。"""

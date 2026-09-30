@@ -4,8 +4,9 @@ NcatBot 5 的 TRPG 跑团插件：**通用掷骰** + **极简 AI 主持人** + *
 
 - 🎲 通用掷骰：`NdM±K`、优势/劣势、d100 奖励/惩罚骰、成功率/DC 判定、公开/暗骰（不支持重复投掷）
 - 🎭 AI 主持：兼容 OpenAI 接口，玩家行动由 AI 以主持人身份叙事推进剧情
+- 🏠 房间系统：群与房间绑定，每群至多一个房间，用户自由加入退出，/trpg start后向LLM传递参与人员信息
 - 🛡 权限：全局管理员（RBAC）+ 本群群主/群管理自动放行 + 默认拒绝
-- 📝 提示词：内置默认主持词，可用配置文件导入自定义主持词，也可为单个团单独设定
+- 📝 提示词：内置多种主持人风格模板，支持全局切换和自定义配置
 
 > 版本 v0.1.0（第一版）。角色卡、世界书、多 NPC、剧本导入、完整存档等将在后续版本提供，
 > 设计细节见 [DESIGN.md](./DESIGN.md)。
@@ -18,6 +19,18 @@ NcatBot 5 的 TRPG 跑团插件：**通用掷骰** + **极简 AI 主持人** + *
 
 本插件是工作区 `plugins/NcatBotTRPG` 下的 git 子模块，克隆工作区后即存在。若手动部署，
 把整个 `NcatBotTRPG/` 目录放入工作区的 `plugins/` 下即可。
+
+### 2. 准备提示词配置
+
+插件需要提示词配置文件才能使用自定义主持人风格。请复制插件目录中的 `prompts_template.yaml` 
+到插件工作区：
+
+```powershell
+# 复制提示词模板到插件工作区
+Copy-Item "plugins\NcatBotTRPG\prompts_template.yaml" "data\NcatBotTRPG\prompts.yaml"
+```
+
+插件工作区通常位于 `data/NcatBotTRPG/` 目录下。如果该目录不存在，机器人会自动创建。
 
 ### 2. 安装依赖
 
@@ -36,13 +49,30 @@ pip install -r plugins/NcatBotTRPG/requirements.txt
 plugin:
   plugin_configs:
     NcatBotTRPG:
-      ApiKey: "sk-xxxxxxxxxxxxxxxx"        # 你的 API Key
+      # === 基础配置 ===
+      ApiKey: "sk-xxxxxxxxxxxxxxxx"        # 你的 OpenAI API Key
       Model: "openai/gpt-4o-mini"          # 模型名（兼容 OpenAI 的任意服务）
       BaseUrl: "https://api.openai.com/v1"  # API 地址
       IsConfigured: true                    # 必须置 true，否则无法开团
-      # 可选：从文件导入主持人提示词（相对插件工作区或绝对路径）
-      # PromptFile: "prompt.md"
+      
+      # === 行为配置 ===
+      MustAtBot: true                      # 群聊中是否必须 @机器人 才触发 AI 主持
+      InsertUserdataAsPrefix: true        # 群聊行动是否附带 昵称(QQ) 前缀
+      MaxHistoryMessages: 30               # 每团保留的最近消息条数
+      EnableCriticalDice: true             # 是否判定大成功/大失败
+      EnableGroupOwnerAutoAuth: true       # 群主/群管理自动放行本群管理命令
+      EnableInGameDiceKeyword: true       # 是否启用局内掷骰关键词
+      InGameDiceKeyword: ".r"              # 局内掷骰关键词（h 后缀为暗骰）
+      MaxDiceCount: 100                    # 单次最大骰数（防刷）
+      MaxDiceSides: 10000                  # 骰子最大面数（防刷）
+      StripReasoning: true                 # 是否剥离推理模型的思维链（防止暴露）
+      
+      # === 提示词配置 ===
+      PromptConfigFile: "prompts.yaml"     # 提示词配置文件路径（相对于插件工作区）
+      ActivePrompt: "default"              # 当前激活的提示词名称
 ```
+
+> 只使用掷骰功能时 **无需配置** API Key，但 `IsConfigured` 仍需设置为 `true`。
 
 > 只使用掷骰功能时 **无需配置** API Key。
 
@@ -66,7 +96,8 @@ plugin:
 | `Model` | str | `openai/gpt-4o-mini` | 使用的模型 |
 | `BaseUrl` | str | `https://api.openai.com/v1` | API 地址 |
 | `IsConfigured` | bool | `false` | **置 true 后**才允许 `/trpg start` |
-| `PromptFile` | str | `""` | 主持人提示词文件（空=内置默认）。相对路径基于插件工作区解析 |
+| `PromptConfigFile` | str | `prompts.yaml` | 提示词配置文件路径（相对于插件工作区） |
+| `ActivePrompt` | str | `default` | 当前激活的提示词名称 |
 | `StripReasoning` | bool | `true` | 剥离推理模型返回的思维链，避免暴露给用户 |
 | `MustAtBot` | bool | `true` | 群聊是否必须 @机器人 才触发 AI 主持 |
 | `InsertUserdataAsPrefix` | bool | `true` | 群聊行动是否附带 `昵称(QQ)：` 前缀 |
@@ -80,40 +111,88 @@ plugin:
 
 ---
 
-## 三、主持人提示词（三层）
+## 三、主持人提示词配置
+
+### 3.1 新的提示词配置系统
+
+插件支持灵活的提示词配置系统，包含多种预设风格和自定义选项：
+
+#### 预设提示词模板
+
+插件内置多种主持人风格，通过 `prompts.yaml` 配置管理：
+
+- **default**：默认主持人（平衡叙事与规则）
+- **literary**：文学风格（注重描写细节和情感）
+- **fast_paced**：快节奏（简洁明快，注重剧情推进）
+- **immersive**：沉浸式（完全代入角色）
+- **debug**：调试模式（提供详细的游戏信息和规则解释）
+
+### 3.2 配置方法
+
+#### 方法一：使用预设提示词（推荐）
+
+1. **查看可用提示词**：
+   ```
+   /trpg prompt list
+   ```
+
+2. **切换提示词**：
+   ```
+   /trpg prompt switch literary
+   ```
+
+3. **查看当前提示词**：
+   ```
+   /trpg prompt show
+   ```
+
+#### 方法二：自定义提示词配置
+
+编辑插件工作区中的 `prompts.yaml` 文件（通常位于 `data/NcatBotTRPG/prompts.yaml`），
+添加或修改提示词：
+
+```yaml
+custom_style:
+  name: "自定义风格"
+  description: "自定义的主持人风格"
+  content: |
+    你是自定义的 TRPG 主持人。
+    - 根据你的需求编写提示词内容
+    - 支持多行文本
+    - 使用 Markdown 格式
+```
+
+#### 提示词文件位置说明
+
+- **插件工作区**：通常位于 `data/NcatBotTRPG/` 目录下
+- **配置文件路径**：相对路径相对于插件工作区解析
+- **自动创建**：如果插件工作区不存在，机器人启动时会自动创建
+
+### 3.3 提示词优先级
 
 最终发给模型的 system 提示词按以下顺序组装：
 
 ```
-[ 默认提示词 ] + [ 本团专属设定 ]
-   ↑                    ↑
-   ├─ PromptFile 导入（若配置且文件有效）
-   └─ 否则内置默认主持词
+[ 配置的提示词 ] + [ 本团专属设定 ]
+    ↑
+    ├─ PromptConfigFile 加载的提示词（按 ActivePrompt 选用）
+    └─ 否则内置默认主持词
 ```
 
-1. **内置默认主持词**：插件自带，开箱即用（见 `llm.py:DEFAULT_KEEPER_PROMPT`）。
-2. **PromptFile 导入**：配置 `PromptFile` 指向一个 UTF-8 文本/Markdown 文件，
-   插件加载时读入，作为默认提示词。**这是推荐的全局自定义方式。**
-3. **本团专属设定**：通过 `/trpg start <设定>` 或 `/trpg prompt set <设定>` 单独为某个
-   群/会话设置，追加在默认提示词之后。
+### 3.4 为单个团单独设定
 
-### 如何创建提示词文件
+除了全局提示词配置，还可以为每个团单独设定：
 
-在插件工作区（`data/NcatBotTRPG/`）放置 `prompt.md`，然后配置 `PromptFile: "prompt.md"`：
-
-```markdown
-# 我的主持人设定
-
-你是《克苏鲁的呼唤》风格的调查团主持人（KP）。
-- 用第二人称描述场景，营造压抑、细思极恐的氛围。
-- 每次回复 2~4 句，结尾给出 2~3 个可调查的方向。
-- 绝不编造骰子结果，需要检定时提示玩家「请掷 1d100」。
+```
+/trpg prompt set "这是一个恐怖风格的团"
 ```
 
-路径解析：绝对路径直接使用；相对路径相对**插件工作区**（`data/NcatBotTRPG/`）解析。
-文件缺失或为空时自动回退内置默认提示词，并在日志中告警。
+这个设定会追加在全局提示词之后，仅影响当前团。
 
-> 仓库内 `tests/fixtures/example_prompt.md` 是**仅供自动化测试**的示例，请勿直接用于生产。
+> 提示词配置文件路径解析：绝对路径直接使用；相对路径相对**插件工作区**（`data/NcatBotTRPG/`）解析。
+> 文件缺失或为空时自动回退内置默认提示词，并在日志中告警。
+> 
+> **注意**：提示词配置文件应放在插件工作区中，而不是插件目录中。插件目录中的 `prompts_template.yaml` 是模板文件，需要复制到工作区使用。
 
 ---
 
@@ -151,20 +230,120 @@ plugin:
 
 > 不支持重复投掷（`N#expr`）：一次行动只能掷一次，防止刷骰。
 
-### 4.2 开团与主持
+### 4.2 房间系统（群聊专用）
+
+房间与会话绑定：**每个群默认有且只有一个房间**（初始 0 人、无需创建），用户可在开团前自由加入与退出。
+
+#### 房间管理命令
 
 | 命令 | 权限 | 说明 |
 |---|---|---|
-| `/trpg start [设定]` | 群内：管理员；私聊：本人 | 开启本会话的 AI 跑团 |
+| `/trpg room join [密码]` | 所有人 | 加入当前群房间 |
+| `/trpg room leave` | 所有人 | 离开当前群房间 |
+| `/trpg room status` | 所有人 | 查看房间状态 |
+| `/trpg room participants` | 所有人 | 查看参与者列表 |
+
+> `/trpg start` 会自动把发起人加入房间；无需先执行任何创建命令。
+
+#### 房间状态
+
+- **准备中（preparing）**：可以加入玩家，可以开始跑团
+- **进行中（running）**：跑团进行中，不能加入新玩家
+- **已结束（finished）**：跑团已结束
+
+### 4.3 玩家状态管理（群聊专用）
+
+玩家状态管理允许玩家在跑团过程中管理自己的参与状态，包括中途退出、请求托管和重新加入。
+
+#### 玩家状态命令
+
+| 命令 | 权限 | 说明 |
+|---|---|---|
+| `/trpg away [原因]` | 所有人 | 暂时离开游戏 |
+| `/trpg offline [原因]` | 所有人 | 长时间离线 |
+| `/trpg back` | 所有人 | 重新加入游戏 |
+| `/trpg ai-control [原因]` | 所有人 | 请求AI托管角色 |
+| `/trpg status` | 所有人 | 查看当前团状态和玩家状态 |
+
+#### 玩家状态类型
+
+- **活跃（active）**：正常参与游戏
+- **离开（away）**：暂时离开，可能很快回来
+- **离线（offline）**：长时间离开
+- **请求AI托管（requested_ai_control）**：请求AI控制角色
+
+#### 状态管理流程
+
+1. **暂时离开**：
+   ```
+   /trpg away 需要处理一些事情
+   ```
+
+2. **重新加入**：
+   ```
+   /trpg back
+   ```
+
+3. **长时间离线**：
+   ```
+   /trpg offline 今天有事，明天再回来
+   ```
+
+4. **请求AI托管**：
+   ```
+   /trpg ai-control 需要暂时离开，请帮我控制角色
+   ```
+
+#### LLM状态信息
+
+在每次行动时，LLM会接收以下信息：
+- 参与者列表
+- 每个玩家的当前状态
+- AI托管请求
+
+这使主持人能够根据玩家状态调整剧情和角色行为。
+
+#### 房间使用流程
+
+1. **玩家加入房间**（可选，`start` 会自动加入发起人）：
+   ```
+   /trpg room join
+   ```
+
+2. **查看房间状态**：
+   ```
+   /trpg room status
+   ```
+
+3. **开始跑团**：
+   ```
+   /trpg start 这是一个奇幻风格的跑团
+   ```
+
+### 4.3 开团与主持
+
+| 命令 | 权限 | 说明 |
+|---|---|---|
+| `/trpg start [设定]` | 群内：管理员 | 开启本会话的 AI 跑团（自动加入房间） |
 | `/trpg act <行动>` | 所有人 | 向 AI 主持提交一次行动 |
-| `/trpg status` | 所有人 | 查看团状态（是否进行中、设定、消息数） |
+| `/trpg away [原因]` | 所有人 | 暂时离开游戏 |
+| `/trpg offline [原因]` | 所有人 | 长时间离线 |
+| `/trpg back` | 所有人 | 重新加入游戏 |
+| `/trpg ai-control [原因]` | 所有人 | 请求AI托管角色 |
+| `/trpg status` | 所有人 | 查看团状态（包含玩家状态） |
 | `/trpg prompt [set <设定>\|show\|reset]` | 群内：管理员；私聊：本人 | 查看/设置本团专属设定 |
+| `/trpg prompt list` | 全局管理员 | 查看可用的提示词模板 |
+| `/trpg prompt switch <提示词名>` | 全局管理员 | 切换当前使用的提示词 |
+| `/trpg prompt show [提示词名]` | 全局管理员 | 显示提示词内容 |
 | `/trpg reset` | 群内：管理员；私聊：本人 | 清空剧情历史（保留设定） |
 | `/trpg stop` | 群内：管理员；私聊：本人 | 结束本会话的团（保留记录） |
 | `/trpg help` | 所有人 | 帮助 |
 
 **群聊开团后如何行动**：发送 `@机器人 <你的行动>`（`MustAtBot=true` 时），
 或使用 `/trpg act <行动>`。
+
+**房间系统优势**：使用房间系统后，在 `/trpg start` 时会向LLM传递所有参与者信息，
+让主持人知道当前有哪些玩家在游戏中，提供更好的游戏体验。
 
 **掷骰与主持的衔接**：团进行中时，掷骰结果会被缓存，并在你的**下一次行动**时通过
 system prompt 交给主持人（LLM），使其能据此推进剧情与判定。推荐流程：先掷骰，再提交行动。
@@ -198,6 +377,7 @@ Bot:  侦查成功。你注意到最里侧的男人袖口沾着暗红色的污�
 | `/trpg-admin stop [group:<id>\|user:<id>]` | 结束指定会话的团 |
 | `/trpg-admin reset [group:<id>\|user:<id>]` | 清空指定会话的剧情历史 |
 | `/trpg-admin prompt <set <设定>\|show\|reset> [目标]` | 管理指定会话的专属设定 |
+| `/trpg-admin room-admin <set-description\|set-password\|set-max\|delete>` | 群内：管理员 | 房间管理 |
 | `/trpg-admin help` | 帮助 |
 
 不指定目标时作用于当前会话。权限：全局管理员或本群群主/群管理。
@@ -232,8 +412,8 @@ Bot:  侦查成功。你注意到最里侧的男人袖口沾着暗红色的污�
 - **群里 @机器人没反应**：该群尚未 `/trpg start` 开团；或 `MustAtBot=true` 但未真正 @ 到机器人。
 - **`.r` 没反应**：局内关键词仅在**团激活后**生效，且关键词需在消息开头；可用
   `/trpg roll` 代替。
-- **主持人说话不像预期**：通过 `PromptFile` 导入全局主持词，或用
-  `/trpg prompt set <设定>` 为单个团追加设定。
+- **主持人说话不像预期**：使用 `/trpg prompt list` 查看可用提示词，`/trpg prompt switch` 切换风格；
+  或编辑 `prompts.yaml`，或用 `/trpg prompt set <设定>` 为单个团追加设定。
 - **报错「连续…」/ 模型报错**：检查 `BaseUrl`/`ApiKey`/`Model` 是否正确、网络是否可达，
   查看 `logs/` 日志中的 `ncatbot_trpg` 记录。
 - **和 OpenAI 聊天插件同时 @机器人 会重复回复吗？**：不会。跑团进行中的会话由 NcatBotTRPG

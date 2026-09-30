@@ -2,7 +2,7 @@
 
 ## 概述
 
-NcatBotTRPG（NcatBot 5）自研纯插件：通用掷骰 + 极简 AI 跑团主持（openai SDK）+ 三层 RBAC 权限体系。
+NcatBotTRPG（NcatBot 5）：通用掷骰 + 极简 AI 跑团主持（openai SDK）+ 三层 RBAC 权限体系。
 本插件为 git 子模块（仓库 `Yang-qwq/NcatBotTRPG`）——修改后须在子模块目录内 `git commit`。
 
 ## 仓库事实
@@ -17,12 +17,16 @@ NcatBotTRPG（NcatBot 5）自研纯插件：通用掷骰 + 极简 AI 跑团主�
 | 层 | 文件 | 职责 |
 |---|---|---|
 | 入口 | `__init__.py` → `main.py:NcatBotTRPGPlugin` | 生命周期、配置默认值、RBAC 注册、消息触发、AI 主持 |
-| 命令 | `command_handler.py:NcatBotTRPGCommandMixin` | `/trpg`、`/trpg-admin`、`/trpgrbac`、三层权限、帮助文本 |
+| 命令 | `command_handler.py:NcatBotTRPGCommandMixin` | `/trpg`（roll/start/act/status/prompt/reset/stop）、`/trpg-admin`、`/trpgrbac`、三层权限、帮助文本 |
+| 房间命令 | `room_commands.py:RoomCommandMixin` | `/trpg room *` 与 `/trpg-admin room-admin *` |
+| 玩家状态 | `player_status_commands.py:PlayerStatusCommandMixin` | `/trpg away`/`offline`/`back`/`ai-control` |
+| 提示词命令 | `prompt_commands.py:PromptCommandMixin` | `/trpg prompt list`/`switch`/`show`（模板管理） |
 | 掷骰 | `dice.py` | 纯函数掷骰引擎（解析/投掷/判定/格式化） |
-| LLM | `llm.py` | openai 客户端封装、默认主持人提示词、PromptFile 导入机制、消息前缀格式 |
-| 会话 | `session.py:SessionStore` | `data['sessions']` 的读写与截断 |
+| LLM | `llm.py` | openai 客户端封装、内置默认提示词、消息前缀格式 |
+| 会话 | `session.py:SessionStore` | `data['sessions']` 的读写与截断、房间/玩家状态管理 |
 
-MRO：`NcatBotTRPGPlugin(NcatBotTRPGCommandMixin, NcatBotPlugin)`。
+MRO：`NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin, PromptCommandMixin, NcatBotTRPGCommandMixin, NcatBotPlugin)`。
+各命令 Mixin 通过 MRO 复用 `command_handler` 的 `_scope_sid`/`_check_admin`/`_save_data` 等基础设施。
 
 ## 消息触发（main.py）
 
@@ -30,8 +34,8 @@ MRO：`NcatBotTRPGPlugin(NcatBotTRPGCommandMixin, NcatBotPlugin)`。
   再按 `MustAtBot`（默认需 @机器人）判定是否作为 AI 行动。
 - 私聊 `on_private_message`：跳过 `/` 命令；激活时匹配关键词，否则作为 AI 行动。
 - `_handle_action`：拼接 `[system] + history` → `llm.chat` → 回复 → 追加助手消息 → `_save_data`。
-  其中 system 会注入缓存的掷骰结果（`build_roll_context`）。LLM 同步调用经 `asyncio.to_thread`，
-  异常统一 `_log.error(traceback)` + 友好回复。
+  其中 system 会注入缓存的掷骰结果（`build_roll_context`）、群聊房间的参与人员/玩家状态/AI 托管请求
+  （房间未创建或为空时自动跳过）。LLM 同步调用经 `asyncio.to_thread`，异常统一 `_log.error(traceback)` + 友好回复。
 - **跨插件协调**：公开 `is_group_session_active(group_id)` / `is_user_session_active(user_id)`；
   OpenAIChatPlugin 在分发 @机器人 消息前调用，跑团进行中时让出处理权，避免两插件重复回复。
 
@@ -42,7 +46,9 @@ MRO：`NcatBotTRPGPlugin(NcatBotTRPGCommandMixin, NcatBotPlugin)`。
 失败回复“命令格式错误”）。管理/团操作按 scope 决定是否校验权限。
 
 - **`/trpg`**：`roll` `rh` `start` `act` `status` `prompt` `reset` `stop` `help`
-- **`/trpg-admin`**：`stop` `reset` `prompt` `help`，支持 `group:<id>` / `user:<id>` 目标
+  `room join|leave|status|participants`、`away` `offline` `back` `ai-control`
+  （房间/玩家状态为群聊功能；房间为默认存在，无需创建）
+- **`/trpg-admin`**：`stop` `reset` `prompt` `room-admin` `help`，支持 `group:<id>` / `user:<id>` 目标
 - **`/trpgrbac`**：`grant` `revoke` `list` `help`
 
 内部复用：`_apply_prompt` / `_apply_reset` / `_apply_stop` 返回回复文本，供 `/trpg` 与
@@ -84,9 +90,17 @@ MRO：`NcatBotTRPGPlugin(NcatBotTRPGCommandMixin, NcatBotPlugin)`。
 ## 会话与持久化
 
 - `self.data['sessions'] = {'group': {}, 'user': {}}`，`SessionStore` 持其引用；
-  结构 `{active, prompt, history, pending_rolls, started_at}`。
+  会话结构 `{active, prompt, history, pending_rolls, started_at}`；
+  另有 `rooms`（`group_id -> room_info`）支撑房间系统。
 - 修改后调用 `self._save_data()`。`history` 按 `MaxHistoryMessages` 截断。
 - `session.py` 的 `create/update/clear_history/append_turn` 只操作内存，由调用方持久化。
+- **房间系统**（与会话绑定）：每群默认有且只有一个房间，`get_or_create_room()` 惰性创建并持久化
+  （默认 0 人）；`room_view()` 为只读视图（不落库，供 `/trpg status`、`/trpg room status` 展示）；
+  `join_room` 加入、`leave_room` 离开（清空后仍保留房间，不删除）；
+  `/trpg start` 自动把发起人加入房间再 `start_room`；`finish_room` 标记结束（可重新 start/join）；
+  `delete_room()` 仅管理员重置房间（下次访问会重新惰性创建）。
+- **玩家状态**：`set_player_status` 等以 `requested_ai_control/away/offline/active` 标记，
+  经 `build_player_status_info` 注入 system prompt。
 - **掷骰结果传递**：`pending_rolls` 为 `{user_id, text}` 列表，每位玩家至多一条未结算掷骰。
   `_do_roll` 在团激活时先 `has_pending_roll` 拦截重复投掷，再 `add_pending_roll(user_id, ...)`；
   `_handle_action` 用 `peek_pending_rolls` 经 `llm.build_roll_context()` 注入 system prompt，
@@ -95,15 +109,19 @@ MRO：`NcatBotTRPGPlugin(NcatBotTRPGCommandMixin, NcatBotPlugin)`。
 ## 配置项
 
 见 `main.py:on_load()` 的 `init_defaults`；读取整型配置统一用 `_get_int_config(key, default)`
-（兼容字符串含 `|` 的复合值）。`PromptFile` 为主持人提示词文件路径，`StripReasoning`
-控制思维链剥离（默认开）。写配置用 `self.set_config(key, value)`。
+（兼容字符串含 `|` 的复合值）。提示词配置：`PromptConfigFile`（默认 `prompts.yaml`，相对插件
+工作区或绝对路径）、`ActivePrompt`（当前激活的模板名）、`AvailablePrompts`（运行时加载的模板名
+列表）。`StripReasoning` 控制思维链剥离（默认开）。写配置用 `self.set_config(key, value)`。
 
 ## AI 主持与 LLM
 
-- `llm.build_system_prompt(custom, default_prompt)` = 默认主持人提示词 + 可选「本团专属设定」；
-  默认提示词优先取 `PromptFile` 导入内容，否则用内置 `DEFAULT_KEEPER_PROMPT`。
-- **Prompt 导入**：`main.reload_prompt()` → `llm.load_prompt_file(plugin, path)`；
-  相对路径基于 `plugin.workspace` 解析；缺失/为空/IO 错误仅告警并回退内置默认；`on_load` 自动调用。
+- `llm.build_system_prompt(custom, default_prompt, plugin)` = 激活的提示词模板 + 可选「本团专属设定」；
+  传 `plugin` 时取 `plugin.get_active_prompt()`，否则用 `default_prompt`，最终兜底内置
+  `DEFAULT_KEEPER_PROMPT`。
+- **提示词模板**：`main.load_prompts_config()` 从 `PromptConfigFile`（默认插件工作区的
+  `prompts.yaml`）加载 `{name: {content, ...}}`，`reload_prompt()` 重新加载并按 `ActivePrompt`
+  设置当前提示词；文件缺失/格式错误回退内置默认（`_get_builtin_prompts()`，default 复用
+  `llm.DEFAULT_KEEPER_PROMPT`）。`/trpg prompt list|switch|show` 管理（需全局管理员）。
 - `llm.LLMClient.chat(messages, ...)` 经 `asyncio.to_thread` 调 openai SDK。
 - **思维链隔离**：`llm.strip_reasoning()` 剥离 `<think>`/`<reasoning>` 等标签及 DeepSeek-R1
   全角分隔符（未闭合开标签连同其后内容移除；缺少开标签的孤儿闭标签如仅剩 `</think>`
@@ -122,7 +140,8 @@ MRO：`NcatBotTRPGPlugin(NcatBotTRPGCommandMixin, NcatBotPlugin)`。
   `NCATBOT_CONFIG_PATH` 指向 `tests/ncatbot_test_config.yaml`（root=123456），禁止触碰真实
   `config.yaml` / `data/`。
 - AI 链路测试用 `tests/fake_llm.FakeLLMClient` 替换 `plugin.llm._client`，禁止真实网络。
-- Prompt 导入测试用 `tests/fixtures/example_prompt.md`（仅测试用），断言 system 消息内容。
+- 提示词模板测试用 `tests/fixtures/prompts.yaml`（仅测试用），断言 system 消息内容；
+  切换提示词会 `set_config` 持久化，测试中须 stub `plugin.set_config` 避免污染真实配置。
 - 权限用例须断言底层 API 行为（`get_group_member_list` 是否被调用、缓存命中、严格路径不查询群角色）。
 - `test_dice_engine.py`、`test_reasoning_unit.py` 为纯函数测试（无需 async 标记），其余为事件链路测试。
 - 运行（插件目录内）：`python -m pytest tests -v -o "addopts="`。

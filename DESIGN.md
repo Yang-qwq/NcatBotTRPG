@@ -6,7 +6,7 @@
 
 | 项 | 结论 |
 |---|---|
-| 架构路线 | **自研纯插件**：不依赖外部服务，不移植整套引擎 |
+| 架构路线 | 不依赖外部服务，不移植整套引擎 |
 | 规则系统 | 通用掷骰 + 自由叙事 |
 | LLM 接入 | 内置 openai SDK（`ApiKey`/`Model`/`BaseUrl`，与 OpenAIChatPlugin 一致） |
 | v1 范围 | 骨架 + RBAC + 掷骰 + 极简 AI 主持 |
@@ -21,7 +21,10 @@ plugins/NcatBotTRPG/
 ├── __init__.py             # 导出 NcatBotTRPGPlugin
 ├── main.py                 # 入口：init_defaults、RBAC 注册 + root 自动授权、消息触发、AI 主持
 ├── command_handler.py      # Mixin：/trpg、/trpg-admin、/trpgrbac；三层权限；帮助文本
-├── dice.py                 # 自研掷骰引擎（纯函数）
+├── room_commands.py        # Mixin：/trpg room *、/trpg-admin room-admin *
+├── player_status_commands.py # Mixin：/trpg away|offline|back|ai-control
+├── prompt_commands.py      # Mixin：/trpg prompt list|switch|show（模板管理）
+├── dice.py                 # 掷骰引擎（纯函数）
 ├── llm.py                  # LLM 客户端封装（openai SDK，可替换单元）+ 默认主持人提示词
 ├── session.py              # 团会话状态存取（DataMixin data['sessions']）
 ├── LICENSE                 # AGPL-3.0
@@ -29,11 +32,11 @@ plugins/NcatBotTRPG/
 ├── requirements.txt        # openai
 ├── DESIGN.md               # 本文件
 ├── README.md / AGENTS.md
-└── tests/                  # conftest + ncatbot_test_config.yaml + fake_llm + fixtures/example_prompt.md + 8 个测试文件
+└── tests/                  # conftest + ncatbot_test_config.yaml + fake_llm + fixtures/prompts.yaml + 9 个测试文件
 ```
 
-MRO：`NcatBotTRPGPlugin(NcatBotTRPGCommandMixin, NcatBotPlugin)`。掷骰与 LLM 保持独立单元，
-未来可替换为 NcatBot 内置 AI 适配器（`api.ai`）或 diceframe 后端而不改动命令层。
+MRO：`NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin, PromptCommandMixin, NcatBotTRPGCommandMixin, NcatBotPlugin)`。
+掷骰与 LLM 保持独立单元，未来可替换为 NcatBot 内置 AI 适配器（`api.ai`）或 diceframe 后端而不改动命令层。
 
 ## 2. 命令总览
 
@@ -73,8 +76,9 @@ MRO：`NcatBotTRPGPlugin(NcatBotTRPGCommandMixin, NcatBotPlugin)`。掷骰与 LL
 ## 4. AI 主持（`llm.py` + `main.py`）
 
 - 团激活后，`@机器人 <文本>`（`MustAtBot=True` 时）或 `/trpg act <文本>` 作为玩家行动。
-- 消息序列 = `[system: 默认主持人提示词 + 本团专属设定] + 最近 MaxHistoryMessages 条历史`；
-  默认主持人提示词优先取 `PromptFile` 导入的文件，未配置/读取失败时回退内置 `DEFAULT_KEEPER_PROMPT`。
+- 消息序列 = `[system: 激活的提示词模板 + 本团专属设定] + 最近 MaxHistoryMessages 条历史`；
+  提示词模板来自 `PromptConfigFile`（默认插件工作区的 `prompts.yaml`），按 `ActivePrompt`
+  选用，缺失/无效时回退内置 `llm.DEFAULT_KEEPER_PROMPT`。
 - `openai` SDK 的同步调用经 `asyncio.to_thread` 执行，避免阻塞事件循环。
 - **思维链隔离**：`llm.strip_reasoning()` 剥离 `<think>…</think>`、`<reasoning>…</reasoning>` 等
   思维链标签及 DeepSeek-R1 全角分隔符（未闭合开标签连同其后内容移除；缺少开标签的
@@ -93,20 +97,32 @@ MRO：`NcatBotTRPGPlugin(NcatBotTRPGCommandMixin, NcatBotPlugin)`。掷骰与 LL
   OpenAIChatPlugin 在分发 @机器人 消息前查询，跑团进行中的会话由本插件接管，
   避免两插件重复回复（仅读取状态，不依赖 handler 执行顺序）。
 
-## 4.1 Prompt 导入机制（极简）
+## 4.1 提示词模板机制
 
-`PromptFile` 配置指向一个 UTF-8 文本/Markdown 文件（相对插件工作区或绝对路径），
-`on_load()` 经 `llm.load_prompt_file()` 读入并保存为 `plugin.default_prompt`；
-`llm.build_system_prompt(custom, default_prompt)` 组装最终 system 提示词。
-导入失败（缺失/为空/IO 错误）仅告警并回退内置默认，不阻塞加载。
-`reload_prompt()` 支持配置变更后重新导入。测试用示例见 `tests/fixtures/example_prompt.md`。
+`PromptConfigFile`（默认 `prompts.yaml`，相对插件工作区或绝对路径）为 YAML 模板集合，
+形如 `{name: {name, description, content}}`；`on_load()` 经 `main.load_prompts_config()`
+加载并保存到 `plugin.available_prompts`，当前使用的模板由 `ActivePrompt` 决定
+（`plugin.get_active_prompt()`）。`llm.build_system_prompt(custom, default_prompt, plugin)`
+组装最终 system 提示词：优先取激活模板，缺省时兜底内置 `llm.DEFAULT_KEEPER_PROMPT`。
+文件缺失/格式错误仅告警并回退内置默认（`main._get_builtin_prompts()`），不阻塞加载。
+`reload_prompt()` 支持配置变更后重新加载；`/trpg prompt list|switch|show` 需全局管理员。
+测试用模板见 `tests/fixtures/prompts.yaml`。
 
 ## 5. 团会话（`session.py`）
 
 会话键：群聊按 `group_id`，私聊按 `user_id`。每个会话保存
 `{active, prompt, history, pending_rolls, started_at}`，其中 `pending_rolls` 为
 `{user_id, text}` 列表（每位玩家至多一条未结算掷骰）。`reset` 清空 `history` 与
-`pending_rolls` 并保留 `prompt` 与 `active`；`stop` 置 `active=False` 并保留历史。
+`pending_rolls` 并保留 `prompt` 与 `active`；`stop` 置 `active=False` 并保留历史
+（群聊同时 `finish_room` 房间）。
+
+**房间系统（与会话绑定，默认存在）**：`sessions['rooms']`（`group_id -> room_info`）。
+每群有且只有一个房间，`get_or_create_room()` 惰性创建并持久化默认房间（0 人），无需
+`/trpg room create`；`room_view()` 为只读视图供状态展示（不落库）。玩家经 `/trpg room join`
+加入，`/trpg start` 自动把发起人加入房间。状态 `preparing/running/finished` 由
+`start_room`/`finish_room` 管理；`leave_room` 清空后仍保留房间（不删除）。
+`player_statuses` 记录 `active/away/offline/requested_ai_control`，经
+`build_participants_info` / `build_player_status_info` 注入 system prompt。
 
 ## 6. 权限体系（三层 RBAC）
 
@@ -130,7 +146,8 @@ MRO：`NcatBotTRPGPlugin(NcatBotTRPGCommandMixin, NcatBotPlugin)`。掷骰与 LL
 | `Model` | str | `openai/gpt-4o-mini` | 模型 |
 | `BaseUrl` | str | `https://api.openai.com/v1` | API 地址 |
 | `IsConfigured` | bool | false | 是否已配置 |
-| `PromptFile` | str | `""` | 主持人提示词文件（空=内置默认；相对工作区解析） |
+| `PromptConfigFile` | str | `prompts.yaml` | 提示词模板 YAML（相对工作区或绝对路径） |
+| `ActivePrompt` | str | `default` | 当前激活的提示词模板名 |
 | `StripReasoning` | bool | true | 剥离推理模型思维链（`<think>`/`<reasoning>`/DeepSeek 全角分隔符） |
 | `MustAtBot` | bool | true | 群内需 @机器人 触发 AI 主持 |
 | `InsertUserdataAsPrefix` | bool | true | 群聊行动附带 昵称(QQ) 前缀 |
@@ -159,8 +176,9 @@ AI 链路用 `fake_llm.FakeLLMClient` 替换 `plugin.llm._client`，禁止真实
 - `test_dice.py` — 掷骰命令（含暗骰私聊）
 - `test_permission.py` — 三层 RBAC（API 级断言）
 - `test_session.py` — 团会话管理
+- `test_room.py` — 房间系统（默认房间惰性创建 / join-leave 保留 / 开团自动加入）
 - `test_ai.py` — AI 主持链路（含思维链剥离与仅思维链兜底）
-- `test_prompt.py` — PromptFile 导入机制（导入生效 / 缺失回退 / 与专属设定叠加）
+- `test_prompt.py` — 提示词模板机制（导入生效 / 缺失回退 / ActivePrompt 切换 / 与专属设定叠加）
 - `test_reasoning_unit.py` — `strip_reasoning` 纯函数（标签 / 未闭合 / DeepSeek 全角分隔符）
 - `test_roll_context.py` — 掷骰结果缓存与 system prompt 注入、重复投掷拦截、多玩家累积、暗骰标记、reset 清空
 

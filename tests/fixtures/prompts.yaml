@@ -1,0 +1,16 @@
+# 测试用提示词模板（仅用于自动化测试）
+# 位于 tests/fixtures/prompts.yaml，不属于生产配置。
+
+default:
+  name: "测试默认主持人"
+  description: "仅供自动化测试使用"
+  content: |
+    【TEST-ONLY-KEEPER-PROMPT】你是一名仅供测试的极简主持人。
+    玩家行动时，只回复「测试主持人在线」，不要展开剧情。
+
+literary:
+  name: "测试文学风格"
+  description: "仅供自动化测试使用"
+  content: |
+    【TEST-ONLY-LITERARY-PROMPT】你是一名文学风格的测试主持人。
+    玩家行动时，只回复「文学主持人在线」。

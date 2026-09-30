@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AI 主持人 LLM 客户端封装（自研）
+"""AI 主持人 LLM 客户端封装
 
 基于 openai SDK 的 OpenAI 兼容接口，作为可替换单元，未来可切换为
 NcatBot 内置 AI 适配器（``api.ai``）或 diceframe 后端而不改动命令层。
@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-from pathlib import Path
 from typing import List, Optional
 
 from ncatbot.utils.logger import get_log
@@ -141,7 +140,12 @@ def extract_reasoning(text: str) -> str:
     return '\n'.join(cleaned)
 
 
-# 内置默认主持人提示词（自研，未复制任何第三方 prompt）
+
+
+# 群聊中区分不同玩家发言时使用的消息前缀格式
+USER_PREFIX_FORMAT = '{name}({user_id})：{text}'
+
+# 内置默认主持人提示词
 DEFAULT_KEEPER_PROMPT = '''你是一名专业的 TRPG（桌上角色扮演游戏）主持人（GM/KP）。
 
 你的职责：
@@ -153,69 +157,29 @@ DEFAULT_KEEPER_PROMPT = '''你是一名专业的 TRPG（桌上角色扮演游戏
 6. 保持剧情连贯，遵守“本团专属设定”，不与玩家进行游戏外的元讨论。
 7. 每次回复聚焦当前场景，长度适中（通常 2~6 句），必要时给出 2~3 个可选行动方向。'''
 
-# 群聊中区分不同玩家发言时使用的消息前缀格式
-USER_PREFIX_FORMAT = '{name}({user_id})：{text}'
-
-
-def resolve_prompt_path(plugin, path: str) -> Optional[Path]:
-    """将配置中的提示词路径解析为绝对路径。
-
-    相对路径基于插件工作区（``plugin.workspace``）解析，便于随插件数据目录分发。
-
-    :param plugin: 插件实例（提供 workspace）
-    :param path: 配置中的路径（空字符串表示未配置）
-    :return: 绝对路径；未配置返回 None
-    """
-    raw = (str(path) if path is not None else '').strip()
-    if not raw:
-        return None
-    candidate = Path(raw).expanduser()
-    if not candidate.is_absolute():
-        candidate = Path(plugin.workspace) / candidate
-    return candidate
-
-
-def load_prompt_file(plugin, path: str) -> Optional[str]:
-    """从文件导入主持人提示词（极简 prompt 导入机制）。
-
-    仅支持 UTF-8 纯文本 / Markdown；读取失败或内容为空时返回 None，
-    由调用方回退到内置默认提示词，不阻塞插件加载。
-
-    :param plugin: 插件实例（提供 workspace）
-    :param path: 配置的文件路径（相对工作区或绝对路径）
-    :return: 提示词文本；未配置或读取失败返回 None
-    """
-    candidate = resolve_prompt_path(plugin, path)
-    if candidate is None:
-        _log.debug('未配置 PromptFile，使用内置默认主持人提示词')
-        return None
-    try:
-        text = candidate.read_text(encoding='utf-8').strip()
-    except FileNotFoundError:
-        _log.warning(f'PromptFile 不存在，回退内置默认提示词: {candidate}')
-        return None
-    except OSError as e:
-        _log.error(f'读取 PromptFile 失败，回退内置默认提示词: {candidate} - {e}')
-        return None
-    if not text:
-        _log.warning(f'PromptFile 内容为空，回退内置默认提示词: {candidate}')
-        return None
-    _log.info(f'已导入主持人提示词: {candidate}（{len(text)} 字）')
-    return text
-
 
 def build_system_prompt(custom_prompt: str = '',
-                        default_prompt: Optional[str] = None) -> str:
+                        default_prompt: Optional[str] = None,
+                        plugin=None) -> str:
     """拼接主持人 system 提示词。
 
-    优先级：``default_prompt``（来自 PromptFile）> 内置 ``DEFAULT_KEEPER_PROMPT``；
-    其后追加可选的“本团专属设定”。
+    优先级：通过插件获取当前激活的提示词 > ``default_prompt``；
+    其后追加可选的"本团专属设定"。
 
     :param custom_prompt: 本团专属设定文本（可为空）
     :param default_prompt: 通过配置导入的默认提示词（可为空）
+    :param plugin: 插件实例（用于获取当前激活的提示词）
     :return: 完整 system 提示词
     """
-    base = (default_prompt or '').strip() or DEFAULT_KEEPER_PROMPT
+    # 优先取插件当前激活的提示词；失败/缺失时回退 default_prompt，再回退内置默认
+    base = ''
+    if plugin:
+        try:
+            base = plugin.get_active_prompt()
+        except Exception:
+            base = ''
+
+    base = (base or default_prompt or '').strip() or DEFAULT_KEEPER_PROMPT
     custom_prompt = (custom_prompt or '').strip()
     if custom_prompt:
         return f'{base}\n\n【本团专属设定】\n{custom_prompt}'

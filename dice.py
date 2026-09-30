@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""NcatBotTRPG 掷骰引擎（自研）
+"""NcatBotTRPG 掷骰引擎
 
 纯函数实现，不依赖 NcatBot 框架，便于单元测试与未来替换。
 
