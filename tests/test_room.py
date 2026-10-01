@@ -34,15 +34,15 @@ def _rooms(plugin):
     return plugin.data['sessions']['rooms']
 
 
-async def test_group_room_status_shows_default_without_persist(tmp_path, monkeypatch):
-    """查看房间状态展示默认 0 人房间，但只读不落库"""
+async def test_group_status_shows_default_room_without_persist(tmp_path, monkeypatch):
+    """`/trpg status` 展示默认 0 人房间（含房间信息），但只读不落库"""
     monkeypatch.chdir(tmp_path)
     async with _harness() as h:
         plugin = h.get_plugin(PLUGIN_NAME)
         _configure(plugin)
         assert GROUP_ID not in _rooms(plugin)
 
-        await h.inject(group_message('/trpg room status', group_id=GROUP_ID, user_id=ROOT_QQ))
+        await h.inject(group_message('/trpg status', group_id=GROUP_ID, user_id=ROOT_QQ))
         await h.settle()
 
         h.assert_api('send_group_msg').with_text('房间信息', '准备中', '0人')
@@ -56,12 +56,12 @@ async def test_room_join_and_leave_keeps_room(tmp_path, monkeypatch):
         plugin = h.get_plugin(PLUGIN_NAME)
         _configure(plugin)
 
-        await h.inject(group_message('/trpg room join', group_id=GROUP_ID, user_id='111'))
+        await h.inject(group_message('/trpg join', group_id=GROUP_ID, user_id='111'))
         await h.settle()
         assert _rooms(plugin)[GROUP_ID]['participants'] == ['111']
 
         h.reset_api()
-        await h.inject(group_message('/trpg room leave', group_id=GROUP_ID, user_id='111'))
+        await h.inject(group_message('/trpg leave', group_id=GROUP_ID, user_id='111'))
         await h.settle()
         assert _rooms(plugin)[GROUP_ID]['participants'] == []
 

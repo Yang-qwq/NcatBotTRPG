@@ -66,10 +66,24 @@ plugin:
       MaxDiceCount: 100                    # 单次最大骰数（防刷）
       MaxDiceSides: 10000                  # 骰子最大面数（防刷）
       StripReasoning: true                 # 是否剥离推理模型的思维链（防止暴露）
+      MergeSystemMessages: true            # 合并 system 消息（兼容仅接受单条 system 的厂商；
+                                           # 置 false 保持多条 system，缓存友好，但要求后端支持）
       
       # === 提示词配置 ===
       PromptConfigFile: "prompts.yaml"     # 提示词配置文件路径（相对于插件工作区）
       ActivePrompt: "default"              # 当前激活的提示词名称
+
+      # === Function Calling（v1.1，默认开启） ===
+      EnableFunctionCalling: true          # 主持人经工具下发检定/查询/改状态
+      EnableStateMutationTools: true        # 允许受控写工具（HP/属性/物品/场景）
+      MaxToolCallRounds: 5                  # 单轮工具循环上限
+      MaxToolCallsPerRound: 4               # 单次请求最多执行的工具数
+      ToolCallFallback: true                # 模型不支持工具时自动回退为无工具
+      StateProjectionDetail: "short"        # 状态投影：short（短标签）/ full
+      StateProjectionBudget: 1200           # 状态投影字符预算
+      RequestCheckEnabled: true             # 启用检定下发（玩家自行掷骰）
+      CheckRequestAtPlayer: true            # 群聊下发检定时是否 @ 目标玩家
+      MaxEvents: 200                        # 事件账本上限
 ```
 
 > 只使用掷骰功能时 **无需配置** API Key，但 `IsConfigured` 仍需设置为 `true`。
@@ -99,6 +113,7 @@ plugin:
 | `PromptConfigFile` | str | `prompts.yaml` | 提示词配置文件路径（相对于插件工作区） |
 | `ActivePrompt` | str | `default` | 当前激活的提示词名称 |
 | `StripReasoning` | bool | `true` | 剥离推理模型返回的思维链，避免暴露给用户 |
+| `MergeSystemMessages` | bool | `true` | 发送前把所有 system 合并为唯一置顶 system（兼容 GLM 等）；置 `false` 保留多条 system（缓存友好，要求后端支持） |
 | `MustAtBot` | bool | `true` | 群聊是否必须 @机器人 才触发 AI 主持 |
 | `InsertUserdataAsPrefix` | bool | `true` | 群聊行动是否附带 `昵称(QQ)：` 前缀 |
 | `MaxHistoryMessages` | int | `30` | 每团保留的最近消息条数 |
@@ -108,6 +123,18 @@ plugin:
 | `InGameDiceKeyword` | str | `.r` | 局内掷骰关键词（`h` 后缀为暗骰） |
 | `MaxDiceCount` | int | `100` | 单次最大骰数（防刷） |
 | `MaxDiceSides` | int | `10000` | 骰子最大面数（防刷） |
+| `EnableFunctionCalling` | bool | `true` | 是否启用工具调用（主持人下发检定/查询/改状态） |
+| `EnableStateMutationTools` | bool | `true` | 是否允许受控写工具（HP/属性/物品/场景） |
+| `MaxToolCallRounds` | int | `5` | 单轮工具循环上限 |
+| `MaxToolCallsPerRound` | int | `4` | 单次请求最多执行的工具数 |
+| `ToolCallFallback` | bool | `true` | 模型不支持工具时自动回退为无工具 |
+| `StateProjectionDetail` | str | `short` | 状态投影详细度：`short` / `full` |
+| `StateProjectionBudget` | int | `1200` | 状态投影字符预算 |
+| `RequestCheckEnabled` | bool | `true` | 是否启用检定下发 |
+| `CheckRequestAtPlayer` | bool | `true` | 群聊下发检定时是否 @ 目标玩家 |
+| `EnableLoreInjection` | bool | `false` | 世界书注入（阶段 3 预留） |
+| `LoreConfigFile` | str | `lore.yaml` | 世界书配置路径（阶段 3 预留） |
+| `MaxEvents` | int | `200` | 事件账本上限 |
 
 ---
 
@@ -238,12 +265,14 @@ custom_style:
 
 | 命令 | 权限 | 说明 |
 |---|---|---|
-| `/trpg room join [密码]` | 所有人 | 加入当前群房间 |
-| `/trpg room leave` | 所有人 | 离开当前群房间 |
-| `/trpg room status` | 所有人 | 查看房间状态 |
-| `/trpg room participants` | 所有人 | 查看参与者列表 |
+| `/trpg join` | 所有人 | 加入当前群房间 |
+| `/trpg leave` | 所有人 | 离开当前群房间 |
+| `/trpg participants` | 所有人 | 查看参与者列表 |
+| `/trpg status` | 所有人 | 查看团状态（群聊含房间信息，见下） |
 
 > `/trpg start` 会自动把发起人加入房间；无需先执行任何创建命令。
+> 房间状态（名称、状态、参与者数、是否在房间、创建/开始/结束时间、描述）已合并到
+> `/trpg status`，不再单独提供 `/trpg room-status`。
 
 #### 房间状态
 
@@ -307,12 +336,12 @@ custom_style:
 
 1. **玩家加入房间**（可选，`start` 会自动加入发起人）：
    ```
-   /trpg room join
+   /trpg join
    ```
 
-2. **查看房间状态**：
+2. **查看房间与团状态**：
    ```
-   /trpg room status
+   /trpg status
    ```
 
 3. **开始跑团**：
@@ -337,6 +366,7 @@ custom_style:
 | `/trpg prompt show [提示词名]` | 全局管理员 | 显示提示词内容 |
 | `/trpg reset` | 群内：管理员；私聊：本人 | 清空剧情历史（保留设定） |
 | `/trpg stop` | 群内：管理员；私聊：本人 | 结束本会话的团（保留记录） |
+| `/trpg cheat <系统提示词> [true\|false]` | **仅管理员** | 调试：向会话历史插入 system 提示词，布尔参数可选（默认 `true` 立即触发回复） |
 | `/trpg help` | 所有人 | 帮助 |
 
 **群聊开团后如何行动**：发送 `@机器人 <你的行动>`（`MustAtBot=true` 时），
@@ -370,14 +400,38 @@ Bot:  🎲 1d100 = 37
 Bot:  侦查成功。你注意到最里侧的男人袖口沾着暗红色的污渍，手指无意识地攥紧……
 ```
 
-### 4.3 跨会话管理（管理员）
+### 4.3.1 AI 主动下发检定（Function Calling，v1.1）
+
+主持人在需要判定时会**主动下发裁定请求**，骰子始终由玩家亲手掷（保留参与感），
+系统只负责校验骰式并按目标值裁定成败：
+
+```
+用户: @Bot 我撬开码头上的木箱
+Bot:  检定请求：玩家123456 请进行「力量检定」
+      骰式：d20（目标 >= 12）
+      发送命令：.r d20 >=12
+用户: .r d20 >=12
+Bot:  🎲 d20 = 17
+      判定 >= 12：成功
+用户: @Bot 我一脚踹开箱盖
+Bot:  检定成功。木板应声碎裂……
+```
+
+- 主持人只能通过工具给出 `骰式 + 目标值`，**不能自行编造骰值**；玩家命令中的判定会被忽略，
+  成败以请求中记录的目标值为准（系统权威）。
+- 下发后本回合立即结束，等待玩家掷骰；骰式不匹配的掷骰不会结算该检定。
+- **NPC/暗骰**：由系统随机指定一名在场玩家代掷；`hidden=true` 时通过私聊下发。
+- 主持人还可调用只读工具（`get_state`）与受控写工具（HP/属性/物品/场景/事件）；
+  伤害必须有已结算的检定背书。全部配置见 §二，关闭 `EnableFunctionCalling` 即回到纯手动模式。
+
+### 4.4 跨会话管理（管理员）
 
 | 命令 | 说明 |
 |---|---|
 | `/trpg-admin stop [group:<id>\|user:<id>]` | 结束指定会话的团 |
 | `/trpg-admin reset [group:<id>\|user:<id>]` | 清空指定会话的剧情历史 |
 | `/trpg-admin prompt <set <设定>\|show\|reset> [目标]` | 管理指定会话的专属设定 |
-| `/trpg-admin room-admin <set-description\|set-password\|set-max\|delete>` | 群内：管理员 | 房间管理 |
+| `/trpg-admin room-admin <set-description\|set-max\|delete>` | 群内：管理员 | 房间管理 |
 | `/trpg-admin help` | 帮助 |
 
 不指定目标时作用于当前会话。权限：全局管理员或本群群主/群管理。

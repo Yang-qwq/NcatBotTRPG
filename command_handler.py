@@ -25,6 +25,12 @@ ADMIN_PERMISSION = 'NcatBotTRPG.admin'
 # 群角色缓存 TTL（秒），防止刷群成员列表 API
 GROUP_ROLE_CACHE_TTL = 300
 
+# /trpg cheat 的布尔参数取值
+_BOOL_TOKENS = {
+    'true': True, '1': True, 'yes': True, 'y': True, 'on': True,
+    'false': False, '0': False, 'no': False, 'n': False, 'off': False,
+}
+
 # 匹配 At 组件 CQ 码（如 [CQ:at,qq=888888]），用于解析 /trpgrbac 目标
 _AT_CQ_PATTERN = re.compile(r'^\[CQ:at,qq=(\d+)\]$', re.IGNORECASE)
 
@@ -40,20 +46,19 @@ ROLL_HELP_TEXT = '''掷骰用法：
 
 USER_HELP_TEXT = '''NcatBotTRPG 用户命令帮助：
 
-# 🏠 房间管理（群聊专用，每群默认有一个房间，无需创建）
-/trpg room join [密码] - 加入当前群房间
-/trpg room leave - 离开当前群房间  
-/trpg room status - 查看当前群房间状态
-/trpg room participants - 查看房间参与者列表
+# 房间管理（群聊专用，每群默认有一个房间，无需创建）
+/trpg join - 加入当前群房间
+/trpg leave - 离开当前群房间
+/trpg participants - 查看房间参与者列表
 
-# 🎭 玩家状态管理（群聊专用）
+# 玩家状态管理（群聊专用）
 /trpg away [原因] - 暂时离开游戏
 /trpg offline [原因] - 长时间离线
 /trpg back - 重新加入游戏
 /trpg ai-control [原因] - 请求AI托管角色
 /trpg status - 查看当前团状态和玩家状态
 
-# 🎭 跑团控制
+# 跑团控制
 /trpg start [设定] - 开启本会话的 AI 跑团（群内需管理员；创建房间可管理参与者）
 /trpg act <行动> - 向 AI 主持提交一次行动
 /trpg prompt [set <设定>|show|reset] - 查看/设置本团专属设定（群内需管理员）
@@ -64,11 +69,14 @@ USER_HELP_TEXT = '''NcatBotTRPG 用户命令帮助：
 /trpg stop - 结束本会话的团（群内需管理员）
 /trpg help - 显示此帮助
 
-# 🎲 掷骰系统
+# 掷骰系统
 /trpg roll <骰式> [判定] - 公开掷骰/检定
 /trpg rh <骰式> [判定] - 暗骰（结果私聊发送）
 
 局内关键词：团激活后可用 .r / .rh 快速掷骰/暗骰
+
+# 调试（仅管理员）
+/trpg cheat <系统提示词> [true|false] - 向会话历史插入系统提示词（默认 true 立即触发回复）
 
 💡 提示：使用房间系统可以让主持人知道所有参与者，提供更好的游戏体验！'''
 
@@ -77,7 +85,7 @@ ADMIN_HELP_TEXT = '''NcatBotTRPG 管理员命令帮助：
 /trpg-admin stop [group:<id>|user:<id>] - 结束指定会话的团
 /trpg-admin reset [group:<id>|user:<id>] - 清空指定会话的剧情历史
 /trpg-admin prompt <set <设定>|show|reset> [group:<id>|user:<id>] - 管理专属设定
-/trpg-admin room-admin <set-description|set-password|set-max|delete> [参数] - 房间管理
+/trpg-admin room-admin <set-description|set-max|delete> [参数] - 房间管理
 /trpg-admin help - 显示此帮助
 
 不指定目标时作用于当前会话；仅全局管理员或本群群主/群管理可用。'''
@@ -315,8 +323,14 @@ class NcatBotTRPGCommandMixin:
             await self._cmd_reset(event)
         elif sub == 'stop':
             await self._cmd_stop(event)
-        elif sub == 'room':
-            await self._cmd_room(event, args)
+        elif sub == 'join':
+            await self._cmd_room_join(event)
+        elif sub == 'leave':
+            await self._cmd_room_leave(event)
+        elif sub == 'participants':
+            await self._cmd_room_participants(event)
+        elif sub == 'cheat':
+            await self._cmd_cheat(event, args)
         elif sub == 'away':
             await self._cmd_away(event, args)
         elif sub == 'offline':
@@ -358,7 +372,7 @@ class NcatBotTRPGCommandMixin:
         if session_active and self.session_store.has_pending_roll(scope, sid, event.user_id):
             _log.info(f'[{scope} {sid}] 用户({event.user_id})已有未结算掷骰，拒绝重复投掷')
             await event.reply(
-                text='⏳ 你还有一次未结算的掷骰结果，请先提交行动'
+                text='你还有一次未结算的掷骰结果，请先提交行动'
                      '（@我 或 /trpg act <行动>）后再掷骰。',
                 at_sender=False,
             )
@@ -381,12 +395,26 @@ class NcatBotTRPGCommandMixin:
 
         # 团激活时缓存掷骰结果，待玩家下次行动经 system prompt 交给主持人
         if session_active:
+            # 匹配主持人下发的检定：骰式一致才算完成，成败由系统按目标值裁定
+            resolved = self.session_store.resolve_checks_for_roll(
+                scope, sid, event.user_id, dice.roll_key(parsed), outcome.rolls[0].total)
             summary = ' '.join(line.strip() for line in message.splitlines() if line.strip())
             name = event.sender.nickname or str(event.user_id)
             kind = '暗骰' if hidden else '掷骰'
             note = '（暗骰，请勿向其他玩家透露具体数值）' if hidden else ''
+            check_note = ''
+            if resolved:
+                judge_lines = []
+                for check in resolved:
+                    verdict = check.get('verdict') or '未判定'
+                    judge_lines.append(f'{check.get("reason")}：{verdict}')
+                # 让玩家也能看到系统裁定的成败
+                message += '\n' + '\n'.join(judge_lines)
+                check_note = '（完成检定 ' + '、'.join(
+                    f'{c.get("reason")}：{c.get("verdict") or "未判定"}' for c in resolved) + '）'
             self.session_store.add_pending_roll(
-                scope, sid, event.user_id, f'{name}({event.user_id}) {kind}：{summary}{note}')
+                scope, sid, event.user_id,
+                f'{name}({event.user_id}) {kind}：{summary}{note}{check_note}')
             self._save_data()
 
         hint = '\n（主持人将在你的下一次行动中参考此掷骰结果）' if session_active else ''
@@ -400,7 +428,7 @@ class NcatBotTRPGCommandMixin:
             try:
                 await self.api.qq.post_private_msg(event.user_id, text=message + hint)
                 _log.debug(f'[{event.user_id}] 暗骰结果已私聊发送')
-                await event.reply(text='🤫 暗骰结果已私聊发送', at_sender=False)
+                await event.reply(text='暗骰结果已私聊发送', at_sender=False)
             except Exception as e:
                 _log.error(f'暗骰私聊发送失败: {e}')
                 await event.reply(text='暗骰私聊发送失败（可能未添加好友）', at_sender=False)
@@ -423,9 +451,8 @@ class NcatBotTRPGCommandMixin:
                 )
                 return
 
-            # 发起人自动加入房间（无密码房间；有密码需玩家自行 /trpg room join）
-            if not room['password']:
-                self.session_store.join_room(sid, str(event.user_id))
+            # 发起人自动加入房间
+            self.session_store.join_room(sid, str(event.user_id))
 
             # 开始房间
             if not self.session_store.start_room(sid):
@@ -463,7 +490,7 @@ class NcatBotTRPGCommandMixin:
             participant_names = self.session_store.participant_names(sid)
             await event.reply(
                 text=f'✅ 已开启跑团！\n'
-                     f'👥 参与者：{", ".join(participant_names)}\n'
+                     f'参与者：{", ".join(participant_names)}\n'
                      f'用 @我 或 /trpg act <行动> 开始行动；'
                      f'掷骰用 /trpg roll 或 {self._dice_keyword_tip()}',
                 at_sender=False,
@@ -489,19 +516,81 @@ class NcatBotTRPGCommandMixin:
             return
         await self._handle_action(event, text, scope, sid)
 
+    async def _cmd_cheat(self, event: MessageEvent, args: list[str]):
+        """调试：向会话历史插入系统提示词，可选立即触发主持人回复（仅管理员）。
+
+        用法：``/trpg cheat <系统提示词> [true|false]``；末尾布尔参数可选，默认 ``true``（立即回复）。
+        末尾 token 为布尔值时才作为开关解析，否则整体视为系统提示词。
+
+        :param event: 消息事件
+        :param args: 命令参数
+        """
+        if not await self._check_admin(event):
+            return
+        if not args:
+            await event.reply(
+                text='用法：/trpg cheat <系统提示词> [true|false]（默认 true 立即触发回复）',
+                at_sender=False,
+            )
+            return
+        if len(args) >= 2 and args[-1].strip().lower() in _BOOL_TOKENS:
+            immediate = _BOOL_TOKENS[args[-1].strip().lower()]
+            content = ' '.join(args[:-1]).strip()
+        else:
+            immediate = True
+            content = ' '.join(args).strip()
+        if not content:
+            await event.reply(text='系统提示词不能为空', at_sender=False)
+            return
+        if immediate and not self.get_config('IsConfigured'):
+            await event.reply(text='AI 主持尚未配置，无法立即触发回复', at_sender=False)
+            return
+
+        scope, sid = self._scope_sid(event)
+        if not self.session_store.is_active(scope, sid):
+            await event.reply(text='当前没有进行中的团，无法插入系统提示词', at_sender=False)
+            return
+
+        async with self._get_session_lock(scope, sid):
+            session = self.session_store.get(scope, sid)
+            if session is None or not session.get('active'):
+                await event.reply(text='当前没有进行中的团，无法插入系统提示词', at_sender=False)
+                return
+            self.session_store.append_turn(
+                scope, sid, 'system', content,
+                self._get_int_config('MaxHistoryMessages', 30))
+            _log.info(
+                f'[{scope} {sid}] cheat 插入系统提示词（{len(content)} 字，立即回复={immediate}）')
+            if immediate:
+                # 历史末尾是刚插入的 system，补一条临时 user 触发回复并保证对话合法
+                await self._run_host(
+                    event, scope, sid, session,
+                    trigger='（请根据上述系统提示继续推进故事。）')
+            else:
+                self._save_data()
+                await event.reply(text='✅ 已插入系统提示词（未触发回复）', at_sender=False)
+
     async def _cmd_status(self, event: MessageEvent):
-        """查看当前团状态（群聊同时展示房间与玩家状态）。"""
+        """查看当前团状态（群聊同时展示房间与玩家状态）。
+
+        合并了原 ``/trpg room-status`` 的房间信息（玩家是否在房间、创建/开始/结束时间、描述）。
+        """
         scope, sid = self._scope_sid(event)
         lines: list[str] = []
 
         # 群聊：房间信息与玩家状态
         if scope == 'group':
+            user_id = str(event.user_id)
             room = self.session_store.room_view(sid)
+            is_in_room = self.session_store.is_participant(sid, user_id)
             lines.append(f'🏠 房间信息：{room["name"]}')
             lines.append(f'📊 状态：{ROOM_STATUS_TEXT.get(room["status"], "未知")}')
             lines.append(f'👥 总参与者：{len(room["participants"])}人')
+            lines.append('🟢 你在房间中' if is_in_room else '⚪ 你不在房间中')
+            lines.append(f'🕒 创建时间：{room["created_at"]}')
 
             if room['status'] == 'running':
+                lines.append(f'🚀 开始时间：{room.get("started_at", "未知")}')
                 active_players = self.session_store.get_active_players(sid)
                 lines.append(f'🎮 活跃玩家：{len(active_players)}人')
                 player_status_info = self.session_store.build_player_status_info(sid)
@@ -510,6 +599,11 @@ class NcatBotTRPGCommandMixin:
                 requesting_players = self.session_store.has_requests_for_ai_control(sid)
                 if requesting_players:
                     lines.append(f'⚠️ AI托管请求：{len(requesting_players)}人')
+            elif room['status'] == 'finished':
+                lines.append(f'⏹️ 结束时间：{room.get("finished_at", "未知")}')
+
+            if room['description']:
+                lines.append(f'📝 描述：{room["description"]}')
 
         # 团会话状态
         session = self.session_store.get(scope, sid)
@@ -579,6 +673,7 @@ class NcatBotTRPGCommandMixin:
             return '本会话暂无跑团记录'
         self.session_store.clear_history(scope, sid)
         self.session_store.clear_pending_rolls(scope, sid)
+        self.session_store.clear_checks(scope, sid)
         _log.info(f'[{scope} {sid}] 已清空剧情历史')
         return '✅ 已清空剧情历史，保留本团设定与激活状态'
 
@@ -736,7 +831,7 @@ class NcatBotTRPGCommandMixin:
                     at_sender=False,
                 )
                 return
-            lines = [f'🔐 全局管理员列表（共 {len(admins)} 人）：', '']
+            lines = [f'全局管理员列表（共 {len(admins)} 人）：', '']
             for index, uid in enumerate(admins, 1):
                 root_mark = '（root）' if uid == root else ''
                 lines.append(f'  {index}. {uid}{root_mark}')

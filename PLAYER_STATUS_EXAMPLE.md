@@ -14,10 +14,10 @@
 
 ```
 # 每个群默认已有房间，玩家直接加入即可（start 也会自动加入发起人）
-/trpg room join
-/trpg room join
-/trpg room join
-/trpg room join
+/trpg join
+/trpg join
+/trpg join
+/trpg join
 
 # 开始跑团
 /trpg start 这是一个奇幻风格的冒险故事

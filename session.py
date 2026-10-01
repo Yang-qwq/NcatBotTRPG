@@ -15,6 +15,8 @@ from typing import Dict, List, Optional
 
 from ncatbot.utils.logger import get_log
 
+from . import dice
+
 _log = get_log('ncatbot_trpg')
 
 # 会话作用域：group（群聊） / user（私聊）
@@ -57,10 +59,9 @@ class SessionStore:
         return {
             'name': f'群 {group_id} 的房间',
             'created_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'participants': [],  # 默认 0 人，玩家 /trpg room join 后加入
+            'participants': [],  # 默认 0 人，玩家 /trpg join 后加入
             'status': 'preparing',  # preparing, running, finished
             'max_participants': 0,  # 0 表示无限制
-            'password': '',  # 房间密码（可选）
             'description': '',  # 房间描述
         }
 
@@ -95,12 +96,11 @@ class SessionStore:
         """
         return self._rooms.get(str(group_id))
 
-    def join_room(self, group_id: str, user_id: str, password: str = '') -> bool:
+    def join_room(self, group_id: str, user_id: str) -> bool:
         """加入房间。
 
         :param group_id: 群号
         :param user_id: 用户QQ
-        :param password: 房间密码（如果需要）
         :return: 是否成功加入
         """
         room = self.get_or_create_room(group_id)
@@ -109,12 +109,7 @@ class SessionStore:
         if room['status'] not in ('preparing', 'finished'):
             _log.warning(f'房间({group_id})状态不是准备中，无法加入')
             return False
-            
-        # 检查密码
-        if room['password'] and room['password'] != password:
-            _log.warning(f'房间({group_id})密码错误')
-            return False
-            
+
         # 检查人数限制
         if room['max_participants'] > 0 and len(room['participants']) >= room['max_participants']:
             _log.warning(f'房间({group_id})已满')
@@ -280,15 +275,6 @@ class SessionStore:
         :return: 是否成功设置
         """
         return self.update_room(group_id, description=description)
-
-    def set_room_password(self, group_id: str, password: str) -> bool:
-        """设置房间密码。
-
-        :param group_id: 群号
-        :param password: 密码文本
-        :return: 是否成功设置
-        """
-        return self.update_room(group_id, password=password)
 
     def set_room_max_participants(self, group_id: str, max_participants: int) -> bool:
         """设置房间最大参与者数量。
@@ -491,6 +477,8 @@ class SessionStore:
             'prompt': prompt or '',
             'history': [],
             'pending_rolls': [],
+            'pending_checks': [],
+            'resolved_checks': [],
             'started_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         }
         self._sessions[scope][str(session_id)] = session
@@ -536,6 +524,158 @@ class SessionStore:
             session['history'] = history[-limit:]
             _log.debug(f'[{scope} {session_id}] 历史超限，已截断至最近 {limit} 条')
         _log.debug(f'[{scope} {session_id}] 追加历史 {role}（共 {len(session["history"])} 条）')
+
+    # ------------------------------------------------------------------
+    # 检定请求（主持人经 request_check 工具下发给玩家，玩家自行掷骰）
+    # 允许多条并存；玩家掷出匹配骰式后由系统按请求的目标值裁定成败
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ensure_check_fields(session: dict) -> None:
+        """补齐会话的检定字段（兼容旧数据）。"""
+        session.setdefault('pending_checks', [])
+        session.setdefault('resolved_checks', [])
+
+    def add_check(self, scope: str, session_id, check: dict,
+                  limit: int = 20) -> Optional[dict]:
+        """记录一条待玩家掷骰的检定请求。
+
+        :param scope: ``group`` 或 ``user``
+        :param session_id: 群号或用户号
+        :param check: 检定信息（至少含 roller_id / subject / roll_key）
+        :param limit: 最多保留的检定条数（<=0 表示不限制）
+        :return: 写入后的检定字典；会话不存在返回 None
+        """
+        session = self.get(scope, session_id)
+        if session is None:
+            _log.debug(f'[{scope} {session_id}] 记录检定失败：会话不存在')
+            return None
+        self._ensure_check_fields(session)
+        record = dict(check)
+        record.setdefault('id', f'c{len(session["pending_checks"]) + 1}')
+        record.setdefault('status', 'awaiting')
+        record.setdefault('verdict', None)
+        record.setdefault('created_at', datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        session['pending_checks'].append(record)
+        if limit and limit > 0 and len(session['pending_checks']) > limit:
+            session['pending_checks'] = session['pending_checks'][-limit:]
+        _log.info(
+            f'[{scope} {session_id}] 新增检定请求 {record["id"]}：'
+            f'{record.get("subject")} 掷 {record.get("expr")}（{record.get("reason")}）'
+        )
+        return record
+
+    def peek_checks(self, scope: str, session_id, *, status: str = 'awaiting',
+                    roller_id=None) -> List[dict]:
+        """查看检定请求（不带筛选时返回全部待完成项）。
+
+        :param status: 筛选状态（``awaiting`` / ``resolved`` / None 表示不限）
+        :param roller_id: 仅返回该玩家需掷的检定
+        :return: 检定请求列表
+        """
+        session = self.get(scope, session_id)
+        if session is None:
+            return []
+        self._ensure_check_fields(session)
+        result = []
+        for check in session['pending_checks']:
+            if status and check.get('status') != status:
+                continue
+            if roller_id is not None and str(check.get('roller_id')) != str(roller_id):
+                continue
+            result.append(check)
+        return result
+
+    def resolve_checks_for_roll(self, scope: str, session_id, roller_id,
+                                roll_key: str, total: int,
+                                limit: int = 20) -> List[dict]:
+        """玩家掷骰后，结算匹配骰式的待完成检定。
+
+        仅当骰式规范化键（``dice.roll_key``）一致时才算完成；成败由系统按
+        请求中记录的目标值裁定（玩家命令中的判定被忽略，保证权威性）。
+
+        :param scope: ``group`` 或 ``user``
+        :param session_id: 群号或用户号
+        :param roller_id: 掷骰玩家
+        :param roll_key: 掷出骰式的规范化键
+        :param total: 掷出总值
+        :param limit: ``resolved_checks`` 保留上限
+        :return: 本次结算的检定列表（可能为空）
+        """
+        session = self.get(scope, session_id)
+        if session is None:
+            return []
+        self._ensure_check_fields(session)
+        uid = str(roller_id)
+        resolved: List[dict] = []
+        for check in session['pending_checks']:
+            if check.get('status') != 'awaiting':
+                continue
+            if str(check.get('roller_id')) != uid:
+                continue
+            if check.get('roll_key') != roll_key:
+                continue
+            verdict = None
+            op, target = check.get('op'), check.get('target')
+            if op and target is not None:
+                verdict = dice.judge(total, op, int(target))
+            check['status'] = 'resolved'
+            check['verdict'] = verdict
+            resolved.append(check)
+            session['resolved_checks'].append({
+                'id': check.get('id'),
+                'user_id': uid,
+                'subject': check.get('subject'),
+                'reason': check.get('reason'),
+                'verdict': verdict,
+            })
+            if limit and limit > 0 and len(session['resolved_checks']) > limit:
+                session['resolved_checks'] = session['resolved_checks'][-limit:]
+        if resolved:
+            _log.info(
+                f'[{scope} {session_id}] 玩家({uid})掷骰结算 {len(resolved)} 条检定：'
+                + '、'.join(f'{c.get("reason")}={c.get("verdict")}' for c in resolved)
+            )
+        return resolved
+
+    def has_resolved_check(self, scope: str, session_id, roller_id) -> bool:
+        """指定玩家是否有已结算且尚未消费的检定（用于伤害门控）。"""
+        session = self.get(scope, session_id)
+        if session is None:
+            return False
+        uid = str(roller_id)
+        return any(str(item.get('user_id')) == uid
+                   for item in session.get('resolved_checks', []))
+
+    def clear_resolved_checks(self, scope: str, session_id) -> None:
+        """清空已结算检定记录（主主持人回合结束后调用）。"""
+        session = self.get(scope, session_id)
+        if session is not None:
+            session['resolved_checks'] = []
+
+    def clear_checks(self, scope: str, session_id) -> None:
+        """清空全部检定请求（reset 时调用）。"""
+        session = self.get(scope, session_id)
+        if session is not None:
+            session['pending_checks'] = []
+            session['resolved_checks'] = []
+
+    def build_check_context(self, scope: str, session_id) -> str:
+        """把已结算的检定结果拼装为 system 片段（供主持人叙事）。"""
+        session = self.get(scope, session_id)
+        if session is None:
+            return ''
+        items = session.get('resolved_checks', [])
+        if not items:
+            return ''
+        lines = []
+        for item in items:
+            verdict = item.get('verdict') or '（未判定）'
+            lines.append(f'- {item.get("subject")} {item.get("reason")}：{verdict}')
+        return (
+            '\n\n【系统检定结果（由系统裁定，请据此叙事，不得重掷或改判）】\n'
+            + '\n'.join(lines)
+        )
 
     # ------------------------------------------------------------------
     # 待传递掷骰结果（在玩家下一次行动时注入 system prompt 供主持人参考）

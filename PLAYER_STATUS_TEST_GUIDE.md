@@ -14,7 +14,7 @@
 
 **命令**：
 ```
-/trpg room join
+/trpg join
 /trpg start 这是一个测试跑团
 ```
 

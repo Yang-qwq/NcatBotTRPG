@@ -1,0 +1,79 @@
+{
+  "sessions": {
+    "group": {
+      "200200": {
+        "active": true,
+        "prompt": "",
+        "history": [
+          {
+            "role": "user",
+            "content": "测试用户(123456)：搜索"
+          },
+          {
+            "role": "assistant",
+            "content": "看。"
+          }
+        ],
+        "pending_rolls": [],
+        "pending_checks": [
+          {
+            "subject": "玩家123456",
+            "subject_id": "123456",
+            "roller_id": "123456",
+            "expr": "1d100",
+            "roll_key": "1d100",
+            "op": "<=",
+            "target": 50,
+            "reason": "侦查",
+            "hidden": false,
+            "is_npc": false,
+            "id": "c1",
+            "status": "awaiting",
+            "verdict": null,
+            "created_at": "2026-10-01 20:17:02"
+          }
+        ],
+        "resolved_checks": [],
+        "started_at": "2026-10-01 20:17:02",
+        "world": {
+          "characters": {
+            "123456": {
+              "label": "测试用户",
+              "attrs": {
+                "hp": {
+                  "cur": 10,
+                  "max": 10
+                },
+                "san": {
+                  "cur": 50,
+                  "max": 50
+                }
+              },
+              "inventory": [],
+              "conditions": [],
+              "location": ""
+            }
+          },
+          "scene": {},
+          "events": [],
+          "rev": 0
+        }
+      }
+    },
+    "user": {},
+    "rooms": {
+      "200200": {
+        "name": "群 200200 的房间",
+        "created_at": "2026-10-01 20:17:02",
+        "participants": [
+          "123456"
+        ],
+        "status": "running",
+        "max_participants": 0,
+        "password": "",
+        "description": "",
+        "started_at": "2026-10-01 20:17:02"
+      }
+    }
+  }
+}

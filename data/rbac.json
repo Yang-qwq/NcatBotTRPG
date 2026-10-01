@@ -1,0 +1,21 @@
+{
+  "case_sensitive": true,
+  "default_role": null,
+  "roles": {},
+  "users": {
+    "123456": {
+      "whitelist": [
+        "NcatBotTRPG.admin"
+      ],
+      "blacklist": [],
+      "roles": []
+    }
+  },
+  "role_users": {},
+  "role_inheritance": {},
+  "permissions": {
+    "NcatBotTRPG": {
+      "admin": {}
+    }
+  }
+}

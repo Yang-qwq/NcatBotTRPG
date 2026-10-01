@@ -21,7 +21,7 @@ plugins/NcatBotTRPG/
 ├── __init__.py             # 导出 NcatBotTRPGPlugin
 ├── main.py                 # 入口：init_defaults、RBAC 注册 + root 自动授权、消息触发、AI 主持
 ├── command_handler.py      # Mixin：/trpg、/trpg-admin、/trpgrbac；三层权限；帮助文本
-├── room_commands.py        # Mixin：/trpg room *、/trpg-admin room-admin *
+├── room_commands.py        # Mixin：/trpg join|leave|participants、/trpg-admin room-admin *
 ├── player_status_commands.py # Mixin：/trpg away|offline|back|ai-control
 ├── prompt_commands.py      # Mixin：/trpg prompt list|switch|show（模板管理）
 ├── dice.py                 # 掷骰引擎（纯函数）
@@ -117,9 +117,9 @@ MRO：`NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin, PromptComma
 （群聊同时 `finish_room` 房间）。
 
 **房间系统（与会话绑定，默认存在）**：`sessions['rooms']`（`group_id -> room_info`）。
-每群有且只有一个房间，`get_or_create_room()` 惰性创建并持久化默认房间（0 人），无需
-`/trpg room create`；`room_view()` 为只读视图供状态展示（不落库）。玩家经 `/trpg room join`
-加入，`/trpg start` 自动把发起人加入房间。状态 `preparing/running/finished` 由
+每群有且只有一个房间，`get_or_create_room()` 惰性创建并持久化默认房间（0 人），无需创建命令；
+`room_view()` 为只读视图供状态展示（不落库）。玩家经 `/trpg join` 加入，
+`/trpg start` 自动把发起人加入房间。状态 `preparing/running/finished` 由
 `start_room`/`finish_room` 管理；`leave_room` 清空后仍保留房间（不删除）。
 `player_statuses` 记录 `active/away/offline/requested_ai_control`，经
 `build_participants_info` / `build_player_status_info` 注入 system prompt。
@@ -197,3 +197,74 @@ diceframe（AGPL-3.0）、SillyTavern（AGPL-3.0）、TRPG-AI-DM（MIT）。详�
 角色卡/属性、World Info 世界书、多 NPC 群聊扮演、剧本/模组导入、完整存档/读档、
 CoC/DnD 完整规则、AI 工具调用改状态、对接 diceframe 后端、`api.ai` 适配器切换。
 掷骰引擎、LLM 客户端、会话结构均为独立可替换单元，为上述扩展预留了接口。
+
+## 12. v1.1：Function Calling 与检定下发（定稿）
+
+> 本节记录 v1.1 引入工具调用后的设计，**取代** §4 中“v1 不调用 Function Calling”的表述；
+> 掷骰引擎、玩家掷骰命令与 `pending_rolls` 机制保持不变。
+
+### 12.1 决策
+
+| 项 | 结论 |
+|---|---|
+| 接入方式 | 插件自带 openai SDK 直连 `tools=`（不用 `api.ai` 的 MCP） |
+| 循环结构 | 单循环 + 权威执行器（ReAct 错误回灌 + 协议修复 + 去重） |
+| 掷骰权 | 归玩家；AI 用 `request_check` 下发“骰式 + 目标值”，玩家自行掷骰 |
+| 检定参数 | LLM 给 `expression/difficulty`，系统 `dice.parse` 校验、系统裁定成败 |
+| 下发后 | 立即终止本回合，等待玩家掷骰 |
+| NPC/暗骰 | 全部下发给玩家；NPC 由系统随机指定在场玩家代掷 |
+| 完成判定 | 必须匹配指定骰式的掷骰才算完成 |
+| 自由掷骰 | 保留 `has_pending_roll` 防刷，仅下发检定强约束 |
+| 并发检定 | 同一玩家允许多条未完成检定 |
+| 状态存放 | 并入 `data.json`（`setdefault`，零迁移） |
+| 状态注入 | 短可读投影；World Info 仅预留接口 |
+| 兼容 | 默认开 + 不支持工具时回退无工具 |
+
+### 12.2 分层
+
+```
+main.py      编排：会话锁 + rev 快照 → system(模板+设定+房间+状态投影+pending_rolls+检定结果)
+                   → llm 工具循环 → 持久化最终正文 → 清缓存
+llm.py       运行时：tools= 循环 / 协议修复 / 错误回灌 / 去重 / 终止工具 / 回退
+tools.py     工具层：request_check + get_state/search_lore + 5 个受控写工具
+state.py     权威层：紧凑状态 + 原子 apply_ops + 字典 + 投影 + 事件账本
+session.py   存储：characters/scene/events/pending_checks/resolved_checks
+entities.yaml 字典：ID -> 展示名/描述
+lore.py      世界书：阶段 3 预留（search 返回空）
+```
+
+### 12.3 状态四层（参考 `clipboard.txt` 与 diceframe）
+
+1. **权威层**：紧凑 ID + `rev` + 事件账本，写操作统一 `apply_ops`（草稿整体校验后提交）。
+2. **字典层**：`entities.yaml`，展示名只作 label，不作身份。
+3. **注入层**：短可读投影，如 `生命12/15 理智45/60 位置雾港码头 背包治疗药水×1`。
+4. **展示/工具层**：`/trpg status` 懒渲染完整可读；`get_state` 按需查询。
+
+### 12.4 工具清单
+
+- `request_check(target, expression, difficulty, reason, hidden?)` —— 下发检定；目标值 `difficulty`
+  必填（缺失返回 error 供模型重试），成功下发后终止本回合。
+- `get_state` / `search_lore` —— 只读。
+- `change_hp` / `change_attribute` / `manage_inventory` / `update_scene` / `record_event` —— 受控写。
+- 伤害门控：负向 `change_hp` 需 `resolved_checks` 背书。
+
+### 12.5 配置项
+
+`EnableFunctionCalling`(开) / `EnableStateMutationTools`(开) / `MaxToolCallRounds`(5) /
+`MaxToolCallsPerRound`(4) / `ToolCallFallback`(开) / `StateProjectionDetail`(short) /
+`StateProjectionBudget`(1200) / `RequestCheckEnabled`(开) / `CheckRequestAtPlayer`(开) /
+`EnableLoreInjection`(关) / `LoreConfigFile`(lore.yaml) / `MaxEvents`(200)。
+另 `StripReasoning`(开) / `MergeSystemMessages`(开)：后者控制发送前是否把所有 system 合并为唯一
+置顶 system（兼容仅接受单条 system 的厂商；置关可保留多条 system、缓存友好）。
+
+### 12.6 参考映射
+
+- diceframe：intent-only schema、系统裁定、单次掷骰、原子批次 + revision、只读投影、伤害门控。
+- TRPG-AI-DM：工具注册表 + 分发、ReAct 错误回灌、协议修复、可见性、会话锁。
+- SillyTavern：中立存储、关键词/预算 World Info（阶段 3）、工具 schema 预算、按需检索。
+- `D:\Temp\clipboard.txt`：权威紧凑 / 注入短可读 / 展示懒渲染 / 工具按需可读。
+
+### 12.7 测试
+
+`test_state.py`（权威层纯函数）、`test_tools.py`（schema/写工具/伤害门控）、
+`test_check_request.py`（下发→掷骰结算→注入链路）；`fake_llm` 支持脚本化 `tool_calls`。

@@ -1,0 +1,48 @@
+# NcatBotTRPG 实体字典（权威层用 ID 存储，此文件提供人类可读标签/描述）
+#
+# 结构：{section: {entity_id: {label, desc}}}
+# section 目前支持 attributes（属性）/ items（物品）/ statuses（状态）。
+# 未登记的属性/物品/状态仍可用，但会以 ID 原样展示；写工具要求物品必须登记。
+
+attributes:
+  hp:
+    label: 生命
+  san:
+    label: 理智
+  mp:
+    label: 魔力
+  str:
+    label: 力量
+  dex:
+    label: 敏捷
+  con:
+    label: 体质
+  int:
+    label: 智力
+  wis:
+    label: 感知
+  cha:
+    label: 魅力
+  luck:
+    label: 幸运
+
+items:
+  potion_heal:
+    label: 治疗药水
+    desc: 使用后恢复 1d8 生命
+  flashlight:
+    label: 手电
+    desc: 便携照明工具
+  rope:
+    label: 麻绳
+    desc: 结实的攀爬用麻绳
+
+statuses:
+  normal:
+    label: 正常
+  wounded:
+    label: 负伤
+  poisoned:
+    label: 中毒
+  bleeding:
+    label: 流血

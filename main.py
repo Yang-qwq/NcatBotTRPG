@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import traceback
 import yaml
@@ -17,12 +18,13 @@ from ncatbot.types import At
 from ncatbot.utils import get_config_manager
 from ncatbot.utils.logger import get_log
 
-from . import llm
+from . import llm, tools
 from .command_handler import ADMIN_PERMISSION, NcatBotTRPGCommandMixin
 from .player_status_commands import PlayerStatusCommandMixin
 from .prompt_commands import PromptCommandMixin
 from .room_commands import RoomCommandMixin
 from .session import SessionStore, player_label
+from .state import StateStore
 
 _log = get_log('ncatbot_trpg')
 
@@ -41,9 +43,9 @@ class NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin,
     """
 
     name = 'NcatBotTRPG'
-    version = '0.1.0'
+    version = '0.2.0'
     author = 'Yang-qwq'
-    description = 'TRPG 跑团插件：通用掷骰 + 极简 AI 主持 + 三层 RBAC 权限'
+    description = 'TRPG 跑团插件'
 
     async def on_load(self):
         """插件加载时的初始化。"""
@@ -63,8 +65,23 @@ class NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin,
             'MaxDiceCount': 100,            # 单次最大骰数
             'MaxDiceSides': 10000,          # 骰子最大面数
             'StripReasoning': True,         # 是否剥离推理模型的思维链（防止暴露）
+            'MergeSystemMessages': True,    # 发送前合并 system 消息（兼容仅接受单条 system 的厂商；
+                                            # 置 False 保持多条 system，缓存友好，但要求后端支持）
             'PromptConfigFile': 'prompts.yaml',  # 提示词配置文件路径（相对工作区或绝对路径）
             'ActivePrompt': 'default',      # 当前激活的提示词名称
+            # ---- Function Calling ----
+            'EnableFunctionCalling': True,  # 是否启用工具调用（默认开）
+            'EnableStateMutationTools': True,  # 是否暴露受控写工具
+            'MaxToolCallRounds': 5,         # 单轮工具循环上限
+            'MaxToolCallsPerRound': 4,      # 单次请求最多执行的工具数
+            'ToolCallFallback': True,       # 模型不支持工具时回退为无工具
+            'StateProjectionDetail': 'short',  # 状态投影详细度：short/full
+            'StateProjectionBudget': 1200,  # 状态投影字符预算
+            'RequestCheckEnabled': True,    # 是否启用检定下发
+            'CheckRequestAtPlayer': True,   # 群聊下发检定时是否 @ 目标玩家
+            'EnableLoreInjection': False,   # 世界书注入（阶段 3 预留）
+            'LoreConfigFile': 'lore.yaml',  # 世界书配置（阶段 3 预留）
+            'MaxEvents': 200,               # 事件账本上限
         })
 
         # ---- RBAC：注册管理员权限点并自动授予 root（幂等） ----
@@ -83,6 +100,11 @@ class NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin,
         # ---- 初始化 LLM 客户端 ----
         self.llm = llm.LLMClient(self)
 
+        # ---- 实体字典与运行态 ----
+        self.entities = self.load_entities_config()
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._tools_unsupported = False
+
         # ---- 加载提示词模板（prompts.yaml，失败回退内置默认） ----
         self.reload_prompt()
 
@@ -91,7 +113,6 @@ class NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin,
                 '插件未配置，请在全局 config.yaml 的 plugin_configs.NcatBotTRPG 中设置 '
                 'ApiKey / Model / BaseUrl 并将 IsConfigured 置为 true'
             )
-        _log.debug(f'工作区: {self.workspace}')
 
     def load_prompts_config(self) -> bool:
         """加载提示词配置文件，更新可用提示词列表。
@@ -264,6 +285,69 @@ class NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin,
             _log.info(f'已重新加载提示词配置，当前使用: {active_prompt_name}')
         return success
 
+    def load_entities_config(self) -> dict:
+        """加载实体字典（entities.yaml）。
+
+        优先插件工作区，其次插件目录内置；缺失/格式错误回退内置字典（不阻塞加载）。
+
+        :return: 字典配置（``{section: {id: {label, desc}}}``）
+        """
+        candidates = [Path(self.workspace) / 'entities.yaml',
+                      Path(__file__).resolve().parent / 'entities.yaml']
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = yaml.safe_load(f)
+            except Exception as e:  # noqa: BLE001
+                _log.warning(f'读取实体字典失败: {path} - {e}')
+                continue
+            if isinstance(data, dict):
+                _log.info(f'已加载实体字典: {path}')
+                return data
+            _log.warning(f'实体字典格式错误（应为映射）: {path}')
+        _log.debug('未找到实体字典文件，使用内置默认字典')
+        return {}
+
+    # ------------------------------------------------------------------
+    # 世界状态辅助
+    # ------------------------------------------------------------------
+
+    def _state_store(self, scope: str, sid: str) -> StateStore | None:
+        """构造会话的世界状态管理器；会话不存在返回 None。"""
+        session = self.session_store.get(scope, sid)
+        if session is None:
+            return None
+        return StateStore(session, self.entities)
+
+    def _ensure_participant_characters(self, scope: str, sid: str) -> StateStore | None:
+        """为在场玩家惰性创建角色状态，保证状态投影有内容。"""
+        state = self._state_store(scope, sid)
+        if state is None:
+            return None
+        if scope == 'group':
+            for uid in self.session_store.get_participants(sid):
+                state.ensure_character(uid)
+        else:
+            state.ensure_character(sid)
+        return state
+
+    def _build_state_projection(self, state: StateStore | None) -> str:
+        """构建注入 system prompt 的状态投影片段。"""
+        if state is None:
+            return ''
+        detail = self.get_config('StateProjectionDetail', 'short') or 'short'
+        budget = self._get_int_config('StateProjectionBudget', 1200)
+        parts = []
+        if text := state.project(target='party', detail=detail, budget=budget):
+            parts.append(f'【角色状态】\n{text}')
+        if text := state.project_scene(budget=budget):
+            parts.append(f'【当前场景】\n{text}')
+        if not parts:
+            return ''
+        return '\n\n' + '\n\n'.join(parts)
+
     # ------------------------------------------------------------------
     # 跨插件协调接口（供其它插件查询，避免 @机器人 时重复回复）
     # ------------------------------------------------------------------
@@ -358,8 +442,16 @@ class NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin,
     # AI 主持
     # ------------------------------------------------------------------
 
+    def _get_session_lock(self, scope: str, sid: str) -> asyncio.Lock:
+        """获取会话级异步锁（串行化同一会话的回合，防状态交叉写入）。"""
+        key = f'{scope}:{sid}'
+        lock = self._session_locks.get(key)
+        if lock is None:
+            lock = self._session_locks[key] = asyncio.Lock()
+        return lock
+
     async def _handle_action(self, event: MessageEvent, text: str, scope: str, sid: str):
-        """将玩家行动交给 AI 主持并回复。
+        """将玩家行动交给 AI 主持并回复（支持工具调用循环）。
 
         :param event: 消息事件
         :param text: 行动文本（已去除 @ 组件）
@@ -390,43 +482,118 @@ class NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin,
         else:
             content = text
 
+        async with self._get_session_lock(scope, sid):
+            session = self.session_store.get(scope, sid)
+            if session is None or not session.get('active'):
+                return
+            self.session_store.append_turn(
+                scope, sid, 'user', content,
+                self._get_int_config('MaxHistoryMessages', 30))
+            _log.info(f'[{scope} {sid}] 行动: {content[:OMITTED_TEXT_LENGTH]}')
+            await self._run_host(event, scope, sid, session)
+
+    async def _run_host(self, event: MessageEvent, scope: str, sid: str, session: dict,
+                        *, trigger: str | None = None):
+        """在会话当前历史上运行一次 AI 主持回合（调用方需持有会话锁）。
+
+        :param event: 触发消息事件
+        :param scope: 会话作用域
+        :param sid: 会话 ID
+        :param session: 会话字典（调用前已包含待发送的历史）
+        :param trigger: 可选的临时用户消息（仅本次请求，不写入历史）。用于历史末尾不是
+            user 的场景（如 cheat 插入 system 后直接触发），保证对话合法、可触发回复。
+        """
         limit = self._get_int_config('MaxHistoryMessages', 30)
-        self.session_store.append_turn(scope, sid, 'user', content, limit)
+        state = self._ensure_participant_characters(scope, sid)
+        rev_snapshot = state.rev if state else 0
 
-        # 把此前缓存的掷骰结果（类型+结果）经 system prompt 交给主持人
-        system_content = llm.build_system_prompt(
-            session.get('prompt', ''), None, self)
-
-        # 群聊中向 LLM 传递参与人员 / 玩家状态 / AI 托管请求
+        # system = 提示词 + 群上下文 + 状态投影 + 检定结果 + 待传递掷骰
+        system_content = llm.build_system_prompt(session.get('prompt', ''), None, self)
         if scope == 'group':
             system_content += self._build_group_context(sid)
-
+        system_content += self._build_state_projection(state)
+        if resolved := self.session_store.build_check_context(scope, sid):
+            system_content += resolved
         pending_rolls = self.session_store.peek_pending_rolls(scope, sid)
         if pending_rolls:
             system_content += llm.build_roll_context(pending_rolls)
             _log.debug(f'[{scope} {sid}] 注入 {len(pending_rolls)} 条掷骰结果到 system prompt')
 
+        enable_fc = (self.get_config('EnableFunctionCalling', True)
+                     and not self._tools_unsupported)
+        if enable_fc:
+            system_content += llm.TOOL_GUIDANCE
+
         messages = [{'role': 'system', 'content': system_content}]
         messages.extend(list(session.get('history', [])))
-        _log.debug(f'[{scope} {sid}] 请求 LLM：{len(messages)} 条消息')
+        if trigger:
+            # 末尾为 system/assistant 时补一条临时 user，避免 provider 报“非法对话”
+            messages.append({'role': 'user', 'content': trigger})
+        _log.debug(f'[{scope} {sid}] 请求 LLM：{len(messages)} 条消息（工具={enable_fc}）')
 
-        _log.info(f'[{scope} {sid}] 行动: {content[:OMITTED_TEXT_LENGTH]}')
+        tool_list = None
+        executor = None
+        if enable_fc:
+            tool_list = tools.build_tools(self.get_config('EnableStateMutationTools', True))
+            ctx = tools.ToolContext(
+                plugin=self, event=event, scope=scope, sid=sid,
+                state=state, session_store=self.session_store)
+
+            async def _executor(name, args, _ctx=ctx):
+                return await tools.execute(name, args, _ctx)
+
+            executor = _executor
+
+        checks_before = len(self.session_store.peek_checks(scope, sid, status='awaiting'))
         try:
-            reply = await self.llm.chat(messages)
-        except Exception:
+            if tool_list:
+                reply = await self.llm.chat(
+                    messages, tools=tool_list, tool_executor=executor,
+                    max_tool_rounds=self._get_int_config('MaxToolCallRounds', 5),
+                    max_tool_calls_per_round=self._get_int_config('MaxToolCallsPerRound', 4),
+                )
+            else:
+                reply = await self.llm.chat(messages)
+        except Exception as exc:
             _log.error(traceback.format_exc())
-            await event.reply(text='抱歉，AI 主持暂时不可用，请稍后再试', at_sender=False)
-            return
+            if tool_list and self.get_config('ToolCallFallback', True):
+                # 仅非 4xx 才永久回退：4xx 多为本次消息构造问题（如非法 system 序列），
+                # 不代表模型不支持工具，不应关闭后续工具调用。
+                status = getattr(exc, 'status_code', None)
+                if isinstance(status, int) and 400 <= status < 500:
+                    _log.warning(f'工具调用请求非法（HTTP {status}），本次回退无工具，保留工具供后续使用')
+                else:
+                    self._tools_unsupported = True
+                    _log.warning('工具调用失败，已回退为无工具模式（后续跳过工具）')
+                try:
+                    reply = await self.llm.chat(messages)
+                except Exception:
+                    _log.error(traceback.format_exc())
+                    await event.reply(text='抱歉，AI 主持暂时不可用，请稍后再试', at_sender=False)
+                    return
+            else:
+                await event.reply(text='抱歉，AI 主持暂时不可用，请稍后再试', at_sender=False)
+                return
 
+        check_requested = (
+            len(self.session_store.peek_checks(scope, sid, status='awaiting')) > checks_before
+        )
         if not reply:
-            reply = '（主持人似乎陷入了沉默……）'
-        await event.reply(reply, at_sender=False)
-        _log.info(f'[{scope} {sid}] 主持回复: {reply[:OMITTED_TEXT_LENGTH]}')
+            # 已下发检定则由工具消息承担提示，不再补“沉默”文案
+            reply = None if check_requested else '（主持人似乎陷入了沉默……）'
 
-        self.session_store.append_turn(scope, sid, 'assistant', reply, limit)
-        # 掷骰结果已随本次请求交给主持人，清空缓存避免重复注入
+        if reply:
+            await event.reply(reply, at_sender=False)
+            _log.info(f'[{scope} {sid}] 主持回复: {reply[:OMITTED_TEXT_LENGTH]}')
+            self.session_store.append_turn(scope, sid, 'assistant', reply, limit)
+
+        # 掷骰结果与已结算检定均已随本次请求交给主持人，清空避免重复注入
         self.session_store.clear_pending_rolls(scope, sid)
+        self.session_store.clear_resolved_checks(scope, sid)
         self._save_data()
+
+        if state is not None and state.rev != rev_snapshot:
+            _log.debug(f'[{scope} {sid}] 状态 revision {rev_snapshot} -> {state.rev}')
 
     def _build_group_context(self, sid: str) -> str:
         """构建群聊注入 system prompt 的参与人员 / 玩家状态 / AI 托管请求片段。

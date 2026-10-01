@@ -242,6 +242,39 @@ def roll_expression(
     return roll(parse(expr_text, **parse_kwargs), rng=rng, enable_critical=enable_critical)
 
 
+def judge(total: int, op: str, target: int) -> str:
+    """按比较运算符给出判定结果（公开封装，供检定结算复用）。
+
+    :param total: 投掷总值
+    :param op: 比较运算符（``<=`` / ``>=`` / ``<`` / ``>`` / ``==``）
+    :param target: 目标值
+    :return: ``成功`` 或 ``失败``
+    """
+    return _verdict(total, op, target)
+
+
+def roll_key(parsed: ParsedRoll) -> str:
+    """生成骰式的规范化键（用于检定请求与玩家掷骰的匹配）。
+
+    仅包含骰式本身（数量/面数/优势劣势/奖励惩罚/修正），不含判定部分。
+
+    :param parsed: 解析后的骰式
+    :return: 规范化键，如 ``1d100``、``d20 adv``、``d100 bonus1``
+    """
+    parts = [f'{parsed.count}d{parsed.sides}']
+    if parsed.advantage:
+        parts.append('adv')
+    if parsed.disadvantage:
+        parts.append('dis')
+    if parsed.bonus:
+        parts.append(f'bonus{parsed.bonus}')
+    if parsed.penalty:
+        parts.append(f'penalty{parsed.penalty}')
+    if parsed.modifier:
+        parts.append(f'{parsed.modifier:+d}')
+    return ' '.join(parts)
+
+
 def format_outcome(outcome: RollOutcome) -> str:
     """将结果格式化为可直接发送的中文文本。
 

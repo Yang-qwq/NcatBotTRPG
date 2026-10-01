@@ -1,5 +1,5 @@
 name = "NcatBotTRPG"
-version = "0.1.0"
+version = "0.2.0"
 main = "main.py"
 entry_class = "NcatBotTRPGPlugin"
 author = "Yang-qwq"

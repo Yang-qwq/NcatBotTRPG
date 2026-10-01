@@ -7,8 +7,9 @@ NcatBot 内置 AI 适配器（``api.ai``）或 diceframe 后端而不改动命�
 from __future__ import annotations
 
 import asyncio
+import json
 import re
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from ncatbot.utils.logger import get_log
 from openai import OpenAI
@@ -145,6 +146,18 @@ def extract_reasoning(text: str) -> str:
 # 群聊中区分不同玩家发言时使用的消息前缀格式
 USER_PREFIX_FORMAT = '{name}({user_id})：{text}'
 
+# 启用工具调用时追加到 system 的硬约束（数值权威：系统裁定、LLM 只叙事）
+TOOL_GUIDANCE = '''
+
+【工具使用规范（必须遵守）】
+1. 任何需要随机结果的行动，必须调用 request_check 向玩家下发检定，由玩家掷骰；
+   严禁自行编造骰值、成功或失败。
+   下发检定时**必须给出 difficulty 目标值**（如 '<=50' / '>=15'），否则系统无法裁定成败。
+2. 需要修改角色数值、物品或场景时，必须调用对应的写工具；不得只在叙事中声称。
+3. request_check 下发后本回合立即结束，等待玩家掷骰后再继续。
+4. 掷骰结果与检定成败由系统给出，只能据其结果叙事，不得重掷或改判。
+5. 工具返回 error 时按提示修正后重试，不要向玩家暴露工具细节。'''
+
 # 内置默认主持人提示词
 DEFAULT_KEEPER_PROMPT = '''你是一名专业的 TRPG（桌上角色扮演游戏）主持人（GM/KP）。
 
@@ -240,15 +253,47 @@ class LLMClient:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        tools: Optional[List[dict]] = None,
+        tool_executor: Optional[Callable] = None,
+        max_tool_rounds: int = 5,
+        max_tool_calls_per_round: int = 4,
     ) -> str:
-        """发起一次 Chat Completion，返回助手文本。
+        """发起 Chat Completion，返回助手文本；可选的工具调用循环。
 
         :param messages: OpenAI 格式的消息列表
         :param model: 覆盖默认模型
         :param temperature: 采样温度
         :param max_tokens: 最大生成 token 数
+        :param tools: 暴露给模型的工具 schema；为空则单次调用
+        :param tool_executor: ``async (name, args) -> (result_str, terminal)``
+        :param max_tool_rounds: 工具循环最大轮数
+        :param max_tool_calls_per_round: 单轮最多执行的工具数
         :return: 助手回复文本（已去除思维链并 strip）
         """
+        if not tools or tool_executor is None:
+            return await self._chat_once(messages, model=model,
+                                         temperature=temperature, max_tokens=max_tokens)
+        return await self._chat_with_tools(
+            messages, tools=tools, tool_executor=tool_executor,
+            model=model, temperature=temperature, max_tokens=max_tokens,
+            max_tool_rounds=max_tool_rounds,
+            max_tool_calls_per_round=max_tool_calls_per_round,
+        )
+
+    def _normalize(self, messages: List[dict]) -> List[dict]:
+        """按 ``MergeSystemMessages`` 配置规整消息。
+
+        - ``True``（默认）：把所有 system 合并为唯一置顶 system，兼容仅接受单条
+          system 的厂商（如智谱 GLM）。代价是改变了 system 前缀，会破坏 prompt 缓存。
+        - ``False``：保持 system 消息原样（缓存友好），要求后端允许多条/非置顶 system。
+        """
+        if self._plugin.get_config('MergeSystemMessages', True):
+            return normalize_messages(list(messages))
+        return list(messages)
+
+    def _build_kwargs(self, messages: List[dict], *, model, temperature,
+                      max_tokens, tools=None) -> dict:
+        """组装底层 create 参数。"""
         kwargs = {
             'model': model or self._plugin.get_config('Model'),
             'messages': messages,
@@ -257,18 +302,22 @@ class LLMClient:
             kwargs['temperature'] = temperature
         if max_tokens is not None:
             kwargs['max_tokens'] = max_tokens
+        if tools:
+            kwargs['tools'] = tools
+            kwargs['tool_choice'] = 'auto'
+        return kwargs
 
-        # openai SDK 为同步阻塞调用，放入线程避免阻塞事件循环
+    async def _call(self, kwargs: dict):
+        """执行一次底层请求（同步 SDK 放入线程）。"""
         _log.debug(
-            f'调用 LLM：model={kwargs["model"]}, messages={len(messages)}, '
-            f'temperature={temperature}, max_tokens={max_tokens}'
+            f'调用 LLM：model={kwargs["model"]}, messages={len(kwargs["messages"])}, '
+            f'tools={len(kwargs.get("tools") or [])}'
         )
         create = self.client.chat.completions.create
-        response = await asyncio.to_thread(create, **kwargs)
-        message = response.choices[0].message
-        content = (message.content or '').strip()
+        return await asyncio.to_thread(create, **kwargs)
 
-        # 提取并打印思维链（便于调试），参考其它插件的日志风格；不会发送给用户
+    def _log_reasoning(self, message, content: str) -> None:
+        """提取并打印思维链（不发送给用户）。"""
         reasoning = extract_reasoning(content)
         field_reasoning = getattr(message, 'reasoning_content', None)
         if field_reasoning:
@@ -279,15 +328,181 @@ class LLMClient:
                 f'AI思维链: {reasoning[:OMITTED_TEXT_LENGTH]}'
                 f'{"..." if len(reasoning) > OMITTED_TEXT_LENGTH else ""}'
             )
-        if not content:
+        if not content and not getattr(message, 'tool_calls', None):
             if reasoning:
                 _log.warning('模型仅返回思维链而无正文，已忽略以避免暴露思维链')
             else:
                 _log.warning('模型未返回任何正文内容')
 
-        # 推理模型常把思维链以标签等形式混入正文，统一剥离后再返回
+    def _clean(self, content: str) -> str:
+        """按配置剥离思维链并 strip。"""
+        content = (content or '').strip()
         if self._plugin.get_config('StripReasoning', True):
             content = strip_reasoning(content)
+        return content
 
+    async def _chat_once(self, messages, *, model, temperature, max_tokens) -> str:
+        """单次调用（无工具）。"""
+        messages = self._normalize(messages)
+        kwargs = self._build_kwargs(messages, model=model,
+                                    temperature=temperature, max_tokens=max_tokens)
+        response = await self._call(kwargs)
+        message = response.choices[0].message
+        content = (message.content or '').strip()
+        self._log_reasoning(message, content)
+        content = self._clean(content)
         _log.debug(f'LLM 返回 {len(content)} 字')
         return content
+
+    async def _chat_with_tools(self, messages, *, tools, tool_executor, model,
+                               temperature, max_tokens, max_tool_rounds,
+                               max_tool_calls_per_round) -> str:
+        """工具调用循环（ReAct）。
+
+        每轮把 assistant(含 tool_calls) 与对应的 role:tool 结果追加到临时消息列表，
+        直到模型不再请求工具、命中终止工具或达到轮数上限。中间消息不落库。
+        """
+        working = self._normalize(messages)
+        seen: dict = {}  # 去重：name+sorted(args) -> result
+        rounds = 0
+        while True:
+            working = repair_tool_message_pairs(working)
+            kwargs = self._build_kwargs(working, model=model,
+                                        temperature=temperature, max_tokens=max_tokens,
+                                        tools=tools)
+            response = await self._call(kwargs)
+            choice = response.choices[0]
+            message = choice.message
+            content = (message.content or '').strip()
+            tool_calls = getattr(message, 'tool_calls', None)
+            finish_reason = getattr(choice, 'finish_reason', None)
+            self._log_reasoning(message, content)
+
+            if not tool_calls or finish_reason == 'stop':
+                final = self._clean(content)
+                _log.debug(f'LLM 返回 {len(final)} 字（工具轮 {rounds} 次）')
+                return final
+
+            rounds += 1
+            if rounds > max_tool_rounds:
+                _log.warning(f'工具调用达到上限 {max_tool_rounds}，结束本回合')
+                return self._clean(content) or '（主持人思考了很久，请继续你的行动）'
+
+            # 先追加 assistant（含 tool_calls），再追加工具结果（协议顺序）
+            working.append(assistant_message_to_dict(message))
+            terminal_hit = False
+            for tool_call in list(tool_calls)[:max_tool_calls_per_round]:
+                name = getattr(getattr(tool_call, 'function', None), 'name', '') or ''
+                raw_args = getattr(getattr(tool_call, 'function', None), 'arguments', None) or '{}'
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    result, terminal = _payload_error(f'参数 JSON 解析失败: {raw_args!r}'), False
+                else:
+                    key = name + '|' + json.dumps(args, sort_keys=True, ensure_ascii=False)
+                    if key in seen:
+                        result, terminal = '[重复调用已跳过] ' + seen[key], False
+                    else:
+                        try:
+                            result, terminal = await tool_executor(name, args)
+                        except Exception as e:  # noqa: BLE001 - 回灌给模型
+                            _log.error(f'工具 {name} 执行异常: {e}')
+                            result, terminal = _payload_error(f'工具执行失败: {e}'), False
+                        seen[key] = result
+                working.append({
+                    'role': 'tool',
+                    'tool_call_id': getattr(tool_call, 'id', None),
+                    'name': name,
+                    'content': result,
+                })
+                if terminal:
+                    terminal_hit = True
+            if terminal_hit:
+                final = self._clean(content)
+                _log.debug(f'命中终止工具，结束本回合（正文 {len(final)} 字）')
+                return final
+
+
+def _payload_error(message: str) -> str:
+    """llm 内部使用的简单错误 payload（与 tools._payload 结构一致）。"""
+    return json.dumps({'status': 'error', 'message': message}, ensure_ascii=False)
+
+
+def assistant_message_to_dict(message) -> dict:
+    """把 SDK 的 assistant 消息（含 tool_calls）转为可回传的 dict。"""
+    entry = {'role': 'assistant', 'content': getattr(message, 'content', None) or ''}
+    tool_calls = getattr(message, 'tool_calls', None)
+    if tool_calls:
+        entry['tool_calls'] = [
+            {
+                'id': getattr(tc, 'id', None),
+                'type': getattr(tc, 'type', None) or 'function',
+                'function': {
+                    'name': getattr(getattr(tc, 'function', None), 'name', '') or '',
+                    'arguments': getattr(getattr(tc, 'function', None), 'arguments', None) or '{}',
+                },
+            }
+            for tc in tool_calls
+        ]
+    return entry
+
+
+def normalize_messages(messages: List[dict]) -> List[dict]:
+    """规整消息列表：把所有 ``system`` 消息合并为**唯一**的置顶 system。
+
+    部分厂商（如智谱 GLM，错误码 1214「messages 参数非法」）只接受单条、位于
+    开头的 system 消息。``cheat`` 命令会向历史插入 system 消息，故发送前统一
+    合并，避免出现多条 system 或非置顶 system。
+
+    :param messages: 原始消息列表
+    :return: 规整后的新列表（无非 system 变化时原样返回拷贝）
+    """
+    system_parts: List[str] = []
+    rest: List[dict] = []
+    saw_system = False
+    for message in messages:
+        if message.get('role') == 'system':
+            saw_system = True
+            text = (message.get('content') or '')
+            text = text.strip() if isinstance(text, str) else str(text).strip()
+            if text:
+                system_parts.append(text)
+        else:
+            rest.append(message)
+    if not saw_system:
+        return list(messages)
+    if not system_parts:
+        return rest
+    return [{'role': 'system', 'content': '\n\n'.join(system_parts)}] + rest
+
+
+def repair_tool_message_pairs(messages: List[dict]) -> List[dict]:
+    """修复工具消息协议：确保每个 ``assistant.tool_calls`` 后紧跟等量 ``role:tool``。
+
+    对 DeepSeek / OpenAI 兼容网关是硬性要求：缺失的结果补 ``[缺少工具结果]``，
+    并保持顺序稳定。
+
+    :param messages: 待发送的消息列表
+    :return: 修复后的新列表
+    """
+    repaired: List[dict] = []
+    index = 0
+    total = len(messages)
+    while index < total:
+        message = messages[index]
+        repaired.append(message)
+        tool_calls = message.get('tool_calls') if message.get('role') == 'assistant' else None
+        if not tool_calls:
+            index += 1
+            continue
+        ids = [tc.get('id') for tc in tool_calls]
+        index += 1
+        results = {}
+        while index < total and messages[index].get('role') == 'tool':
+            results[messages[index].get('tool_call_id')] = messages[index]
+            index += 1
+        for tool_id in ids:
+            repaired.append(results.get(tool_id) or {
+                'role': 'tool', 'tool_call_id': tool_id, 'content': '[缺少工具结果]',
+            })
+    return repaired

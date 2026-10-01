@@ -18,12 +18,16 @@ NcatBotTRPG（NcatBot 5）：通用掷骰 + 极简 AI 跑团主持（openai SDK�
 |---|---|---|
 | 入口 | `__init__.py` → `main.py:NcatBotTRPGPlugin` | 生命周期、配置默认值、RBAC 注册、消息触发、AI 主持 |
 | 命令 | `command_handler.py:NcatBotTRPGCommandMixin` | `/trpg`（roll/start/act/status/prompt/reset/stop）、`/trpg-admin`、`/trpgrbac`、三层权限、帮助文本 |
-| 房间命令 | `room_commands.py:RoomCommandMixin` | `/trpg room *` 与 `/trpg-admin room-admin *` |
+| 房间命令 | `room_commands.py:RoomCommandMixin` | `/trpg join\|leave\|participants` 与 `/trpg-admin room-admin *` |
 | 玩家状态 | `player_status_commands.py:PlayerStatusCommandMixin` | `/trpg away`/`offline`/`back`/`ai-control` |
 | 提示词命令 | `prompt_commands.py:PromptCommandMixin` | `/trpg prompt list`/`switch`/`show`（模板管理） |
 | 掷骰 | `dice.py` | 纯函数掷骰引擎（解析/投掷/判定/格式化） |
-| LLM | `llm.py` | openai 客户端封装、内置默认提示词、消息前缀格式 |
-| 会话 | `session.py:SessionStore` | `data['sessions']` 的读写与截断、房间/玩家状态管理 |
+| LLM | `llm.py` | openai 客户端封装、工具循环、内置默认提示词、消息前缀格式 |
+| 工具 | `tools.py` | Function Calling 注册表/分发：`request_check` + 只读 + 受控写 |
+| 状态 | `state.py:StateStore` | 世界状态权威层：原子 `apply_ops` + 字典 + 投影 + 事件账本 |
+| 字典 | `entities.yaml` | 实体 ID -> 展示名/描述（物品/属性/状态） |
+| 世界书 | `lore.py` | 世界书检索接口（阶段 3 预留，当前返回空） |
+| 会话 | `session.py:SessionStore` | `data['sessions']` 的读写与截断、房间/玩家状态、检定请求 |
 
 MRO：`NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin, PromptCommandMixin, NcatBotTRPGCommandMixin, NcatBotPlugin)`。
 各命令 Mixin 通过 MRO 复用 `command_handler` 的 `_scope_sid`/`_check_admin`/`_save_data` 等基础设施。
@@ -46,8 +50,16 @@ MRO：`NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin, PromptComma
 失败回复“命令格式错误”）。管理/团操作按 scope 决定是否校验权限。
 
 - **`/trpg`**：`roll` `rh` `start` `act` `status` `prompt` `reset` `stop` `help`
-  `room join|leave|status|participants`、`away` `offline` `back` `ai-control`
-  （房间/玩家状态为群聊功能；房间为默认存在，无需创建）
+  `join` `leave` `participants`、`away` `offline` `back` `ai-control`
+  （房间命令为一级命令，已移除 `/trpg room` 路由；房间/玩家状态为群聊功能；房间为默认存在，无需创建；
+  房间状态已合并进 `/trpg status`）
+- **`/trpg cheat <系统提示词> [true|false]`**（仅管理员）：向会话历史插入一条 system 消息，
+  布尔参数可选、默认 `true`（立即触发一次主持人回复，复用 `_run_host`），`false` 仅插入；
+  末尾 token 为布尔值时才作为开关解析，否则整体视为系统提示词。用于调试。
+  发送前由 `llm.LLMClient._normalize` 按配置 `MergeSystemMessages` 规整 system：默认 `True` 会把所有
+  system 合并为**唯一置顶** system（兼容智谱 GLM 等仅接受单条 system 的厂商，否则 400/1214）；
+  置 `False` 则保留多条 system（**缓存友好**，要求后端支持）。无工具与工具循环两条路径均应用。
+  工具路径若遇 4xx 仅本次回退，不永久关闭工具（`_tools_unsupported`）。
 - **`/trpg-admin`**：`stop` `reset` `prompt` `room-admin` `help`，支持 `group:<id>` / `user:<id>` 目标
 - **`/trpgrbac`**：`grant` `revoke` `list` `help`
 
@@ -95,7 +107,7 @@ MRO：`NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin, PromptComma
 - 修改后调用 `self._save_data()`。`history` 按 `MaxHistoryMessages` 截断。
 - `session.py` 的 `create/update/clear_history/append_turn` 只操作内存，由调用方持久化。
 - **房间系统**（与会话绑定）：每群默认有且只有一个房间，`get_or_create_room()` 惰性创建并持久化
-  （默认 0 人）；`room_view()` 为只读视图（不落库，供 `/trpg status`、`/trpg room status` 展示）；
+  （默认 0 人）；`room_view()` 为只读视图（不落库，供 `/trpg status` 展示房间信息）；
   `join_room` 加入、`leave_room` 离开（清空后仍保留房间，不删除）；
   `/trpg start` 自动把发起人加入房间再 `start_room`；`finish_room` 标记结束（可重新 start/join）；
   `delete_room()` 仅管理员重置房间（下次访问会重新惰性创建）。
@@ -129,8 +141,42 @@ MRO：`NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin, PromptComma
   仅当正文为空时忽略独立 `reasoning_content` 字段，避免暴露思维链。
 - **思维链日志**：`llm.extract_reasoning()` 提取思维链内容，`chat()` 以
   `_log.info(f'AI思维链: {...截断到 OMITTED_TEXT_LENGTH}')` 打印（参考其他插件日志风格）。
-- **v1 不启用 Function Calling / 不修改状态**；若后续引入工具调用，须遵循
-  「数值与状态由系统裁定、LLM 只提议与叙事」的原则（参考 diceframe 权威模型）。
+- **Function Calling（v1.1 起启用）**：工具循环见下节；核心原则是
+  「数值与状态由系统裁定、LLM 只提议与叙事」（diceframe 权威模型）。
+
+## Function Calling / 检定下发
+
+- **接入方式**：插件自带 `openai` SDK 直连 `tools=`（不用框架 `api.ai` 的 MCP）。默认开
+  （`EnableFunctionCalling=True`）；首轮工具调用异常时回退无工具并置内存标志
+  `_tools_unsupported`（`ToolCallFallback`，不持久化）。
+- **工具循环**（`llm.LLMClient._chat_with_tools`）：`finish_reason=='stop'` 或无 `tool_calls`
+  即结束；否则追加 assistant(含 tool_calls) → 逐个执行 → 追加 `role:tool` → 重试。每次调用前
+  `repair_tool_message_pairs` 保证协议顺序；错误以 `role:tool` 回灌（ReAct）；`MaxToolCallRounds`
+  限制轮数，`MaxToolCallsPerRound` 限制单轮工具数；同轮 `name+sorted(args)` 去重。
+- **工具**（`tools.build_tools(enable_mutation)` / `tools.execute`）：
+  - `request_check`（**成功下发后终止本回合**）：把「骰式 + 目标值」下发给玩家，玩家自行掷骰。`target` 为
+    玩家 → 本人掷；为 NPC/实体 → 系统**随机指定在场玩家代掷**。`difficulty` 必填（由 LLM 给出、
+    系统 `dice.parse` 校验）；缺失/非法时返回 error 由模型重试（不终止），成功才写入
+    `session['pending_checks']` 并结束本回合。
+  - 只读：`get_state`（短投影/明细）、`search_lore`（阶段 3 前返回空）。
+  - 受控写（`EnableStateMutationTools` 门控）：`change_hp` / `change_attribute` /
+    `manage_inventory` / `update_scene` / `record_event`。数值统一走 `StateStore.apply_ops`
+    （草稿整体校验后提交 + `rev+1`，失败回滚，fail-closed）。
+- **掷骰权归玩家**：`dice.py`、`/trpg roll|rh`、`.r|.rh`、`pending_rolls` **保持原样**。
+  `command_handler._do_roll` 在团激活时用 `dice.roll_key(parsed)` 匹配 `pending_checks`：
+  **骰式一致才算完成**，成败由系统按请求记录的目标值用 `dice.judge` 裁定（玩家命令里的判定
+  被忽略，保证权威），并写入 `resolved_checks`；随后经 `build_check_context` 注入主持人。
+- **伤害门控**：`change_hp` 负向变更要求该玩家存在未消费的已结算检定
+  （`SessionStore.has_resolved_check`），否则拒绝（`discard_unresolved_player_damage` 思路）。
+- **状态四层**（`state.py` + `entities.yaml`）：权威层紧凑（ID + `rev` + 事件账本）→ 注入层
+  短可读投影（`StateStore.project`，`StateProjectionDetail/Budget`）→ 展示层懒渲染
+  （`detail='full'`）→ 工具按需查询（`get_state`）。
+- **并发**：`main._handle_action` 用会话级 `asyncio.Lock` 串行化同一会话回合；LLM 前后记录
+  `StateStore.rev` 作栅栏日志。工具轮中间消息不落库，仅持久化最终 assistant 正文。
+- **系统提示硬约束**：`llm.TOOL_GUIDANCE` 追加到 system（必须 `request_check`、必须用写工具、
+  下发后等待、只按系统结果叙事）。
+- **新增工具约定**：在 `tools.py` 加 schema + 执行器，写工具须经 `apply_ops` 校验并纳入
+  `build_tools(enable_mutation)`；终止型工具在执行器返回 `terminal=True`；补 `tests/test_tools.py`。
 
 ## 测试要求
 
@@ -143,7 +189,10 @@ MRO：`NcatBotTRPGPlugin(RoomCommandMixin, PlayerStatusCommandMixin, PromptComma
 - 提示词模板测试用 `tests/fixtures/prompts.yaml`（仅测试用），断言 system 消息内容；
   切换提示词会 `set_config` 持久化，测试中须 stub `plugin.set_config` 避免污染真实配置。
 - 权限用例须断言底层 API 行为（`get_group_member_list` 是否被调用、缓存命中、严格路径不查询群角色）。
-- `test_dice_engine.py`、`test_reasoning_unit.py` 为纯函数测试（无需 async 标记），其余为事件链路测试。
+- `test_dice_engine.py`、`test_reasoning_unit.py`、`test_state.py` 为纯函数测试（无需 async 标记），其余为事件链路测试。
+- Function Calling：`test_tools.py`（schema 组合 / 写工具校验 / 伤害门控）、
+  `test_check_request.py`（`request_check` 下发 → 玩家掷骰匹配结算 → 注入主持人 / NPC 代掷 / 暗骰 / 骰式不匹配不结算）。
+  `fake_llm.FakeLLMClient` 支持脚本化 `tool_calls`（dict 形式的脚本项）。
 - 运行（插件目录内）：`python -m pytest tests -v -o "addopts="`。
 
 ## 编码约定

@@ -21,7 +21,7 @@
 
 **命令**：
 ```
-/trpg room status
+/trpg status
 ```
 
 **预期结果**：
@@ -32,7 +32,7 @@
 
 **命令**：
 ```
-/trpg room join
+/trpg join
 ```
 
 **预期结果**：
@@ -43,7 +43,7 @@
 
 **命令**：
 ```
-/trpg room status
+/trpg status
 ```
 
 **预期结果**：
@@ -54,7 +54,7 @@
 
 **命令**：
 ```
-/trpg room participants
+/trpg participants
 ```
 
 **预期结果**：
@@ -78,18 +78,17 @@
 **命令**：
 ```
 /trpg-admin room-admin set-description 这是一个测试房间
-/trpg-admin room-admin set-password 123456
 /trpg-admin room-admin set-max 6
 ```
 
 **预期结果**：
-- 成功设置房间描述 / 密码 / 最大参与者数量（房间不存在时自动创建）
+- 成功设置房间描述 / 最大参与者数量（房间不存在时自动创建）
 
 ### 7. 离开房间测试
 
 **命令**：
 ```
-/trpg room leave
+/trpg leave
 ```
 
 **预期结果**：
@@ -120,25 +119,19 @@
 - 只有准备中 / 已结束的房间可以加入
 
 ### 数据持久化
-- 房间信息保存在 `data/sessions/rooms` 中（`/trpg room status` 只读展示不落库；`join`/`start` 才写库）
+- 房间信息保存在 `data/sessions/rooms` 中（`/trpg status` 只读展示不落库；`join`/`start` 才写库）
 
 ## 错误情况测试
 
 ### 1. 空房间
 ```
-/trpg room participants
+/trpg participants
 ```
 **预期结果**：提示「房间暂无参与者」
 
-### 2. 密码错误
+### 2. 房间已满
 ```
-/trpg room join wrongpass
-```
-**预期结果**：提示「密码错误」
-
-### 3. 房间已满
-```
-/trpg room join
+/trpg join
 ```
 **预期结果**：提示「房间已满」
 
